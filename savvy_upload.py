@@ -60,6 +60,7 @@ POLL_INTERVAL = 10  # seconds between status checks
 RETRY_POLLS = 12    # extra polls per timed-out file during the retry pass
 DEBUG_DIR = Path(__file__).parent
 PENDING_FILE = DEBUG_DIR / "pending_uploads.json"
+UNSENT_EMAIL_FILE = DEBUG_DIR / "unsent_email.json"
 
 # Logging setup
 logging.basicConfig(
@@ -698,21 +699,80 @@ def compose_email(
     return subject, "\n".join(lines)
 
 
-def send_email(subject: str, body: str, recipient: str) -> None:
-    """Send via msmtp if available, otherwise print to terminal."""
-    if shutil.which("msmtp"):
-        log.info(f"Sending email to {recipient} via msmtp...")
-        msg = f"To: {recipient}\nSubject: {subject}\n\n{body}\n"
-        proc = subprocess.run(
-            ["msmtp", recipient],
-            input=msg,
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode == 0:
-            log.info("Email sent.")
+def _try_msmtp(recipient: str, msg: str) -> bool:
+    """Attempt a single msmtp send. Returns True on success."""
+    proc = subprocess.run(
+        ["msmtp", recipient],
+        input=msg,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        return True
+    log.error(f"msmtp failed: {proc.stderr}")
+    return False
+
+
+def _save_unsent_email(subject: str, body: str, recipient: str) -> None:
+    """Persist an unsent email to disk so the next run can retry it."""
+    emails: list[dict] = []
+    if UNSENT_EMAIL_FILE.exists():
+        try:
+            emails = json.loads(UNSENT_EMAIL_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    emails.append({"subject": subject, "body": body, "recipient": recipient})
+    UNSENT_EMAIL_FILE.write_text(json.dumps(emails, indent=2) + "\n")
+    log.info(f"Saved unsent email to {UNSENT_EMAIL_FILE} for retry on next run.")
+
+
+def retry_unsent_emails() -> None:
+    """Try to send any emails that failed on previous runs."""
+    if not UNSENT_EMAIL_FILE.exists():
+        return
+    try:
+        emails = json.loads(UNSENT_EMAIL_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    if not emails or not shutil.which("msmtp"):
+        return
+
+    log.info(f"Found {len(emails)} unsent email(s) from previous run(s), retrying...")
+    still_unsent: list[dict] = []
+    for em in emails:
+        msg = f"To: {em['recipient']}\nSubject: {em['subject']}\n\n{em['body']}\n"
+        if _try_msmtp(em["recipient"], msg):
+            log.info(f"Sent previously-unsent email: {em['subject']}")
         else:
-            log.error(f"msmtp failed: {proc.stderr}")
+            still_unsent.append(em)
+
+    if still_unsent:
+        UNSENT_EMAIL_FILE.write_text(json.dumps(still_unsent, indent=2) + "\n")
+        log.warning(f"{len(still_unsent)} email(s) still unsent.")
+    else:
+        UNSENT_EMAIL_FILE.unlink(missing_ok=True)
+        log.info("All previously-unsent emails sent successfully.")
+
+
+def send_email(subject: str, body: str, recipient: str, max_retries: int = 3) -> None:
+    """Send via msmtp if available, otherwise print to terminal.
+
+    If all retries fail, saves the email to disk so the next run can retry.
+    """
+    if shutil.which("msmtp"):
+        msg = f"To: {recipient}\nSubject: {subject}\n\n{body}\n"
+        for attempt in range(1, max_retries + 1):
+            log.info(f"Sending email to {recipient} via msmtp (attempt {attempt}/{max_retries})...")
+            if _try_msmtp(recipient, msg):
+                log.info("Email sent.")
+                return
+            if attempt < max_retries:
+                delay = 10 * attempt
+                log.info(f"Retrying in {delay}s...")
+                time.sleep(delay)
+        # All retries exhausted — save for next run
+        log.warning("All email send attempts failed. Saving to disk for retry.")
+        _save_unsent_email(subject, body, recipient)
     else:
         # No msmtp (e.g. macOS dev machine) - just dump to terminal
         log.info("msmtp not available, printing email to terminal:\n")
@@ -738,6 +798,9 @@ def run(
 
     cfg = load_config(cli_path=path)
     log.info(f"Aircraft ID: {cfg.aircraft_id}")
+
+    # --- Retry any unsent emails from previous runs ---
+    retry_unsent_emails()
 
     # --- Filter already-uploaded files ---
     last_uploaded = "" if reupload else load_last_uploaded()
