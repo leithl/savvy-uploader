@@ -22,6 +22,7 @@ Configuration (.env file next to this script):
     SAVVY_PASSWORD=yourpassword
     SAVVY_AIRCRAFT_ID=12345
     CSV_DIR=/path/to/engine/csv/files
+    # USER_AGENT=...          (optional, defaults to Chrome 131 on Linux x86_64)
 
 Email:
     On Linux with msmtp configured, sends a summary email to SAVVY_EMAIL.
@@ -44,6 +45,10 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 SAVVY_BASE = "https://apps.savvyaviation.com"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 # Timeouts (ms)
 NAV_TIMEOUT = 60_000
@@ -138,6 +143,7 @@ class Config:
     password: str
     aircraft_id: str
     csv_dir: str
+    user_agent: str = DEFAULT_USER_AGENT
     upload_url: str = ""
     flights_url: str = ""
 
@@ -160,6 +166,7 @@ def load_config(cli_path: str = "") -> Config:
     password = _get("SAVVY_PASSWORD")
     aircraft_id = _get("SAVVY_AIRCRAFT_ID")
     csv_dir = cli_path or _get("CSV_DIR")
+    user_agent = _get("USER_AGENT") or DEFAULT_USER_AGENT
 
     if not email or not password:
         log.error("Missing credentials. Set SAVVY_EMAIL and SAVVY_PASSWORD.")
@@ -176,6 +183,7 @@ def load_config(cli_path: str = "") -> Config:
         password=password,
         aircraft_id=aircraft_id,
         csv_dir=csv_dir,
+        user_agent=user_agent,
     )
 
 
@@ -207,11 +215,12 @@ def savvy_display_name(csv_path: str) -> str:
 
 def cleanup_csvs(
     directory: str,
-    successful: set[str],
+    watermark: str,
     keep_recent: int = 10,
 ) -> int:
-    """Delete successfully-uploaded CSVs, keeping the most recent *keep_recent*.
+    """Delete already-uploaded CSVs, keeping the most recent *keep_recent*.
 
+    Any CSV whose filename sorts <= *watermark* is considered uploaded.
     Only operates when *directory* is a directory (not a single file).
     Returns the number of files deleted.
     """
@@ -222,12 +231,12 @@ def cleanup_csvs(
     # All engine-monitor CSVs, sorted oldest-first by filename
     all_csvs = sorted(p.glob("log_*_*.csv"), key=lambda f: f.name)
 
-    # Keep the most recent N regardless of status
+    # Keep the most recent N regardless of upload status
     protected = {f.name for f in all_csvs[-keep_recent:]}
 
     deleted = 0
     for f in all_csvs:
-        if f.name in successful and f.name not in protected:
+        if f.name <= watermark and f.name not in protected:
             f.unlink()
             log.info(f"Cleaned up: {f.name}")
             deleted += 1
@@ -619,12 +628,7 @@ def run(
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed, slow_mo=slow_mo)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
+        context = browser.new_context(user_agent=cfg.user_agent)
         page = context.new_page()
         page.set_default_timeout(NAV_TIMEOUT)
 
@@ -736,9 +740,9 @@ def run(
         newest = max(r.filename for r in results)
         save_last_uploaded(newest)
 
-    # --- Clean up successfully uploaded CSVs ---
-    successful_files = {r.filename for r in results if "Success" in r.status or "Duplicated" in r.status}
-    n_cleaned = cleanup_csvs(cfg.csv_dir, successful_files, keep_recent=10)
+    # --- Clean up already-uploaded CSVs ---
+    watermark = load_last_uploaded()
+    n_cleaned = cleanup_csvs(cfg.csv_dir, watermark, keep_recent=10) if watermark else 0
 
     # --- Email summary ---
     subject, body = compose_email(results, n_skipped=n_skipped, n_cleaned=n_cleaned)
