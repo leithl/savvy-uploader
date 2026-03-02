@@ -910,16 +910,24 @@ def run(
                 except Exception as e:
                     result.status = f"error: {e}"
                     log.error(f"[{i}/{len(csv_files)}] {filename} failed: {e}")
-                    page.screenshot(
-                        path=str(DEBUG_DIR / f"debug_error_{i}.png")
-                    )
+                    try:
+                        page.screenshot(
+                            path=str(DEBUG_DIR / f"debug_error_{i}.png")
+                        )
+                    except Exception:
+                        pass
 
                 results.append(result)
 
                 # Reload upload page for next file
                 if i < len(csv_files):
-                    page.goto(cfg.upload_url, wait_until="domcontentloaded")
-                    time.sleep(2)
+                    try:
+                        page.goto(cfg.upload_url, wait_until="domcontentloaded")
+                        time.sleep(2)
+                    except Exception as e:
+                        log.error(f"Failed to reload upload page: {e}")
+                        log.info("Stopping batch early — remaining files will be retried next run.")
+                        break
 
             # --- Retry pass for timed-out files from this batch ---
             timed_out = [r.filename for r in results if r.status == "timeout"]
