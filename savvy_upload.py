@@ -30,6 +30,7 @@ Email:
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -56,7 +57,9 @@ UPLOAD_TIMEOUT = 300_000       # 5 min per file (server can be slow with queued 
 LOGIN_TIMEOUT = 30_000
 
 POLL_INTERVAL = 10  # seconds between status checks
+RETRY_POLLS = 12    # extra polls per timed-out file during the retry pass
 DEBUG_DIR = Path(__file__).parent
+PENDING_FILE = DEBUG_DIR / "pending_uploads.json"
 
 # Logging setup
 logging.basicConfig(
@@ -198,6 +201,27 @@ def save_last_uploaded(filename: str) -> None:
     env["LAST_UPLOADED"] = filename
     _write_env(env)
     log.info(f"Updated LAST_UPLOADED={filename}")
+
+
+def load_pending_uploads() -> list[str]:
+    """Load filenames that timed out on a previous run and need verification."""
+    if PENDING_FILE.exists():
+        try:
+            data = json.loads(PENDING_FILE.read_text())
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_pending_uploads(filenames: list[str]) -> None:
+    """Persist filenames that still need verification to disk."""
+    if filenames:
+        PENDING_FILE.write_text(json.dumps(filenames, indent=2) + "\n")
+        log.info(f"Saved {len(filenames)} file(s) to pending verification list.")
+    elif PENDING_FILE.exists():
+        PENDING_FILE.unlink()
+        log.info("Cleared pending verification list.")
 
 
 def savvy_display_name(csv_path: str) -> str:
@@ -497,6 +521,94 @@ def scrape_rejected_flights(page) -> list[RejectedFlight]:
     return rejected
 
 
+def check_file_status_on_page(page, search_name: str) -> str | None:
+    """Check if a file's status is visible on the current page.
+
+    Returns the status string if the file is done processing,
+    None if not found or still processing.
+    """
+    body_text = page.inner_text("body")
+    if search_name not in body_text:
+        return None
+    after_name = body_text.split(search_name, 1)[-1][:200]
+    if "Processing" in after_name:
+        return None
+    return extract_status(after_name)
+
+
+def verify_pending_on_page(page, filenames: list[str]) -> tuple[list[UploadResult], list[str]]:
+    """Check the upload page for status of previously timed-out files.
+
+    Returns (resolved_results, still_pending_filenames).
+    """
+    resolved: list[UploadResult] = []
+    still_pending: list[str] = []
+
+    page.reload(wait_until="domcontentloaded")
+    time.sleep(3)
+
+    for filename in filenames:
+        search_name = savvy_display_name(filename)
+        status = check_file_status_on_page(page, search_name)
+        if status:
+            result = UploadResult(filename=filename, status=f"{status} (verified after retry)")
+            if "Success" in status:
+                flights_match = re.search(r"(\d+) flights?", status)
+                if flights_match:
+                    result.flights_accepted = int(flights_match.group(1))
+            resolved.append(result)
+            log.info(f"  Verified: {filename} -> {status}")
+        else:
+            still_pending.append(filename)
+            log.info(f"  Still pending: {filename}")
+
+    return resolved, still_pending
+
+
+def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadResult], list[str]]:
+    """Retry pass: poll timed-out files from the current batch.
+
+    Reloads the page and polls each file for up to RETRY_POLLS cycles.
+    Returns (resolved_results, still_pending_filenames).
+    """
+    if not timed_out_filenames:
+        return [], []
+
+    log.info(f"Retry pass: re-checking {len(timed_out_filenames)} timed-out file(s)...")
+    resolved: list[UploadResult] = []
+    still_pending: list[str] = []
+
+    page.reload(wait_until="domcontentloaded")
+    time.sleep(3)
+
+    for filename in timed_out_filenames:
+        search_name = savvy_display_name(filename)
+        status = None
+
+        for attempt in range(RETRY_POLLS):
+            status = check_file_status_on_page(page, search_name)
+            if status:
+                break
+            log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} still processing...")
+            time.sleep(POLL_INTERVAL)
+            page.reload(wait_until="domcontentloaded")
+            time.sleep(3)
+
+        if status:
+            result = UploadResult(filename=filename, status=f"{status} (after retry)")
+            if "Success" in status:
+                flights_match = re.search(r"(\d+) flights?", status)
+                if flights_match:
+                    result.flights_accepted = int(flights_match.group(1))
+            resolved.append(result)
+            log.info(f"  Retry resolved: {filename} -> {status}")
+        else:
+            still_pending.append(filename)
+            log.info(f"  Retry exhausted: {filename} still not resolved")
+
+    return resolved, still_pending
+
+
 # ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
@@ -504,13 +616,16 @@ def compose_email(
     results: list[UploadResult],
     n_skipped: int = 0,
     n_cleaned: int = 0,
+    n_verified: int = 0,
+    n_still_pending: int = 0,
 ) -> tuple[str, str]:
     """Build an email subject and body summarising the upload run."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     n_success = sum(1 for r in results if "Success" in r.status)
     n_dup = sum(1 for r in results if "Duplicated" in r.status)
     n_err = sum(1 for r in results if r.status.startswith("error"))
-    n_other = len(results) - n_success - n_dup - n_err
+    n_timeout = sum(1 for r in results if r.status == "timeout")
+    n_other = len(results) - n_success - n_dup - n_err - n_timeout
     total_rejected = sum(len(r.rejected_flights) for r in results)
 
     subject = f"Savvy Upload Report - {now} ({len(results)} files)"
@@ -518,16 +633,23 @@ def compose_email(
     lines = [
         "Savvy Aviation Upload Report",
         f"Run at: {now}",
-        f"Files uploaded: {len(results)}",
+        f"Files processed: {len(results)}",
         f"  Successful: {n_success}",
         f"  Duplicated: {n_dup}",
         f"  Errors:     {n_err}",
-        f"  Other:      {n_other}",
     ]
+    if n_timeout:
+        lines.append(f"  Timed out:  {n_timeout}")
+    if n_other:
+        lines.append(f"  Other:      {n_other}")
+    if n_verified:
+        lines.append(f"  Verified from previous run: {n_verified}")
     if n_skipped:
         lines.append(f"  Skipped (already uploaded): {n_skipped}")
     if n_cleaned:
         lines.append(f"  Cleaned up: {n_cleaned} old CSV(s) deleted")
+    if n_still_pending:
+        lines.append(f"  Still pending verification: {n_still_pending}")
 
     lines += [
         "",
@@ -558,6 +680,11 @@ def compose_email(
     if n_err:
         lines.append(f"WARNING: {n_err} file(s) failed to upload. "
                       "Check the log for details.")
+        lines.append("")
+
+    if n_still_pending:
+        lines.append(f"NOTE: {n_still_pending} file(s) still pending server-side "
+                      "processing. They will be re-checked on the next run.")
         lines.append("")
 
     lines.append("-" * 70)
@@ -615,15 +742,23 @@ def run(
     if skipped_files:
         log.info(f"Skipping {len(skipped_files)} already-uploaded file(s).")
 
-    if not csv_files:
+    # --- Load pending files from previous runs ---
+    pending_filenames = load_pending_uploads()
+    if pending_filenames:
+        log.info(f"Found {len(pending_filenames)} file(s) pending verification from previous run(s).")
+
+    if not csv_files and not pending_filenames:
         if skipped_files:
             log.info("No new CSV files to upload (all already processed).")
         else:
             log.error(f"No CSV files found in: {path}")
         sys.exit(0)
 
-    log.info(f"Found {len(csv_files)} new CSV file(s) to upload.")
+    if csv_files:
+        log.info(f"Found {len(csv_files)} new CSV file(s) to upload.")
+
     results: list[UploadResult] = []
+    verified_results: list[UploadResult] = []
     n_skipped = len(skipped_files)
 
     with sync_playwright() as p:
@@ -643,6 +778,13 @@ def run(
             if cfg.upload_url not in page.url:
                 page.goto(cfg.upload_url, wait_until="domcontentloaded")
                 time.sleep(2)
+
+            # --- Verify pending files from previous runs ---
+            if pending_filenames:
+                log.info(f"Verifying {len(pending_filenames)} file(s) from previous run(s)...")
+                verified, still_pending = verify_pending_on_page(page, pending_filenames)
+                verified_results.extend(verified)
+                pending_filenames = still_pending
 
             # --- Snapshot baseline rejected flights already on the page ---
             page.evaluate("window.scrollTo(0, 0)")
@@ -709,14 +851,33 @@ def run(
                     page.goto(cfg.upload_url, wait_until="domcontentloaded")
                     time.sleep(2)
 
+            # --- Retry pass for timed-out files from this batch ---
+            timed_out = [r.filename for r in results if r.status == "timeout"]
+            if timed_out:
+                page.goto(cfg.upload_url, wait_until="domcontentloaded")
+                time.sleep(2)
+                retry_resolved, retry_still_pending = retry_timed_out(page, timed_out)
+
+                # Update original results for resolved files
+                resolved_map = {r.filename: r for r in retry_resolved}
+                for r in results:
+                    if r.filename in resolved_map:
+                        resolved = resolved_map[r.filename]
+                        r.status = resolved.status
+                        r.flights_accepted = resolved.flights_accepted
+
+                # Any files still not resolved go to persistent pending list
+                pending_filenames.extend(retry_still_pending)
+
             # --- Verify on flights page ---
+            all_to_verify = results + verified_results
             log.info(f"Navigating to flights page: {cfg.flights_url}")
             page.goto(cfg.flights_url, wait_until="domcontentloaded")
             time.sleep(3)
             page.screenshot(path=str(DEBUG_DIR / "debug_flights_page.png"))
 
             flights_body = page.inner_text("body")
-            for r in results:
+            for r in all_to_verify:
                 # Flights page shows full filename (e.g. log_20260213_114814_KANK.csv)
                 if r.filename in flights_body:
                     r.on_flights_page = True
@@ -734,6 +895,9 @@ def run(
         finally:
             browser.close()
 
+    # --- Persist any still-pending files ---
+    save_pending_uploads(pending_filenames)
+
     # --- Update watermark ---
     # Advance to the newest file we attempted, so we don't retry it.
     if results:
@@ -745,7 +909,12 @@ def run(
     n_cleaned = cleanup_csvs(cfg.csv_dir, watermark, keep_recent=10) if watermark else 0
 
     # --- Email summary ---
-    subject, body = compose_email(results, n_skipped=n_skipped, n_cleaned=n_cleaned)
+    all_results = verified_results + results
+    n_verified = len(verified_results)
+    subject, body = compose_email(
+        all_results, n_skipped=n_skipped, n_cleaned=n_cleaned, n_verified=n_verified,
+        n_still_pending=len(pending_filenames),
+    )
     send_email(subject, body, cfg.email)
     log.info("All done.")
 
