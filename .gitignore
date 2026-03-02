@@ -1,0 +1,5 @@
+.env
+venv/
+csvs/
+*.log
+debug_*.png
