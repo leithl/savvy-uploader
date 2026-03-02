@@ -52,7 +52,7 @@ DEFAULT_USER_AGENT = (
 
 # Timeouts (ms)
 NAV_TIMEOUT = 60_000
-UPLOAD_TIMEOUT = 120_000
+UPLOAD_TIMEOUT = 300_000       # 5 min per file (server can be slow with queued uploads)
 LOGIN_TIMEOUT = 30_000
 
 POLL_INTERVAL = 10  # seconds between status checks
