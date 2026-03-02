@@ -241,16 +241,21 @@ def cleanup_csvs(
     directory: str,
     watermark: str,
     keep_recent: int = 10,
+    pending_filenames: list[str] | None = None,
 ) -> int:
     """Delete already-uploaded CSVs, keeping the most recent *keep_recent*.
 
     Any CSV whose filename sorts <= *watermark* is considered uploaded.
+    Files in *pending_filenames* are protected from deletion (they timed
+    out and haven't been confirmed yet — we may need them for re-upload).
     Only operates when *directory* is a directory (not a single file).
     Returns the number of files deleted.
     """
     p = Path(directory).resolve()
     if not p.is_dir():
         return 0
+
+    pending_set = set(pending_filenames or [])
 
     # All engine-monitor CSVs, sorted oldest-first by filename
     all_csvs = sorted(p.glob("log_*_*.csv"), key=lambda f: f.name)
@@ -260,10 +265,12 @@ def cleanup_csvs(
 
     deleted = 0
     for f in all_csvs:
-        if f.name <= watermark and f.name not in protected:
+        if f.name <= watermark and f.name not in protected and f.name not in pending_set:
             f.unlink()
             log.info(f"Cleaned up: {f.name}")
             deleted += 1
+        elif f.name in pending_set:
+            log.info(f"Kept (pending verification): {f.name}")
 
     if deleted:
         log.info(f"Deleted {deleted} uploaded CSV(s), kept {min(len(all_csvs), keep_recent)} most recent.")
@@ -906,7 +913,9 @@ def run(
 
     # --- Clean up already-uploaded CSVs ---
     watermark = load_last_uploaded()
-    n_cleaned = cleanup_csvs(cfg.csv_dir, watermark, keep_recent=10) if watermark else 0
+    n_cleaned = cleanup_csvs(
+        cfg.csv_dir, watermark, keep_recent=10, pending_filenames=pending_filenames,
+    ) if watermark else 0
 
     # --- Email summary ---
     all_results = verified_results + results
