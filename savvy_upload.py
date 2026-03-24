@@ -646,6 +646,8 @@ def compose_email(
         f"  Duplicated: {n_dup}",
         f"  Errors:     {n_err}",
     ]
+    if total_rejected:
+        lines.append(f"  Flights rejected by Savvy: {total_rejected}")
     if n_timeout:
         lines.append(f"  Timed out:  {n_timeout}")
     if n_other:
@@ -678,11 +680,6 @@ def compose_email(
                     f"      {rf.date}  {rf.departure} -> {rf.destination}"
                     f"  ({rf.duration})"
                 )
-        lines.append("")
-
-    if total_rejected:
-        lines.append(f"NOTE: {total_rejected} flight(s) were rejected "
-                      "(e.g. too short, unknown airports).")
         lines.append("")
 
     if n_err:
