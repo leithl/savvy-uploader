@@ -3,3 +3,4 @@ venv/
 csvs/
 *.log
 debug_*.png
+__pycache__/

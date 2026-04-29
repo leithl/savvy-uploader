@@ -225,17 +225,28 @@ def save_pending_uploads(filenames: list[str]) -> None:
         log.info("Cleared pending verification list.")
 
 
-def savvy_display_name(csv_path: str) -> str:
-    """Derive the name Savvy uses in the Recent Uploads table.
+def _text_after_filename(body_text: str, filename: str) -> str | None:
+    """Return up to 200 chars of body_text following the file's display name.
 
-    Savvy strips the extension and airport-code suffix, keeping only
-    the date/time portion: log_YYYYMMDD_HHMMSS
+    The upload page may render the row with the full filename
+    (log_YYYYMMDD_HHMMSS_KXXX[.csv]) or, on older UIs, just the
+    date/time prefix (log_YYYYMMDD_HHMMSS). We try the full stem first
+    so the split lands cleanly past the filename, falling back to the
+    prefix and consuming any airport-code suffix that follows. Returns
+    None if neither form is on the page.
     """
-    stem = Path(csv_path).stem  # e.g. "log_20260213_113501_KANK"
-    parts = stem.split("_")
-    if len(parts) >= 3 and parts[0] == "log":
-        return "_".join(parts[:3])  # log_YYYYMMDD_HHMMSS
-    return stem
+    full_stem = Path(filename).stem  # log_YYYYMMDD_HHMMSS_KXXX
+    if full_stem in body_text:
+        tail = body_text.split(full_stem, 1)[-1]
+        return re.sub(r"^\.csv\b", "", tail)[:200]
+
+    parts = full_stem.split("_")
+    if len(parts) >= 4 and parts[0] == "log":
+        prefix = "_".join(parts[:3])
+        if prefix in body_text:
+            tail = body_text.split(prefix, 1)[-1]
+            return re.sub(r"^_[A-Z0-9]+(\.csv)?\b", "", tail)[:200]
+    return None
 
 
 def cleanup_csvs(
@@ -411,7 +422,7 @@ def upload_single_file(page, csv_path: str) -> None:
         fc_info.value.set_files(csv_path)
 
 
-def poll_upload_status(page, search_name: str) -> str:
+def poll_upload_status(page, filename: str) -> str:
     """Poll the upload page until the file's status is no longer 'Processing...'.
 
     Returns the final status string, or 'timeout' if we gave up.
@@ -423,20 +434,16 @@ def poll_upload_status(page, search_name: str) -> str:
         time.sleep(1)
 
         body_text = page.inner_text("body")
+        after_name = _text_after_filename(body_text, filename)
 
-        if search_name not in body_text:
-            log.info(f"  Poll {attempt + 1}: '{search_name}' not yet visible on page.")
+        if after_name is None:
+            log.info(f"  Poll {attempt + 1}: '{filename}' not yet visible on page.")
+        elif "Processing" in after_name:
+            log.info(f"  Poll {attempt + 1}: Still processing...")
         else:
-            # Grab the ~200 chars after the filename to find the status
-            after_name = body_text.split(search_name, 1)[-1][:200]
-
-            if "Processing" in after_name:
-                log.info(f"  Poll {attempt + 1}: Still processing...")
-            else:
-                # Extract the status text (e.g. "File Duplicated", "File Too Small")
-                status = extract_status(after_name)
-                log.info(f"  Poll {attempt + 1}: Done -> {status}")
-                return status
+            status = extract_status(after_name)
+            log.info(f"  Poll {attempt + 1}: Done -> {status}")
+            return status
 
         time.sleep(POLL_INTERVAL)
         page.reload(wait_until="domcontentloaded")
@@ -475,6 +482,9 @@ def extract_status(text_after_name: str) -> str:
     cleaned = re.sub(r"\d{4}-\d{2}-\d{2}", "", text_after_name)
     cleaned = re.sub(r"[●•·✓]", "", cleaned).strip()
     first_line = cleaned.split("\n")[0].strip()[:40]
+    # Refuse to return obvious filename fragments as a status
+    if first_line.startswith(("_", ".")) or first_line.endswith(".csv"):
+        return "unknown"
     return first_line if first_line else "completed"
 
 
@@ -529,17 +539,15 @@ def scrape_rejected_flights(page) -> list[RejectedFlight]:
     return rejected
 
 
-def check_file_status_on_page(page, search_name: str) -> str | None:
+def check_file_status_on_page(page, filename: str) -> str | None:
     """Check if a file's status is visible on the current page.
 
     Returns the status string if the file is done processing,
     None if not found or still processing.
     """
     body_text = page.inner_text("body")
-    if search_name not in body_text:
-        return None
-    after_name = body_text.split(search_name, 1)[-1][:200]
-    if "Processing" in after_name:
+    after_name = _text_after_filename(body_text, filename)
+    if after_name is None or "Processing" in after_name:
         return None
     return extract_status(after_name)
 
@@ -556,8 +564,7 @@ def verify_pending_on_page(page, filenames: list[str]) -> tuple[list[UploadResul
     time.sleep(3)
 
     for filename in filenames:
-        search_name = savvy_display_name(filename)
-        status = check_file_status_on_page(page, search_name)
+        status = check_file_status_on_page(page, filename)
         if status:
             result = UploadResult(filename=filename, status=f"{status} (verified after retry)")
             if "Success" in status:
@@ -590,11 +597,10 @@ def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadRe
     time.sleep(3)
 
     for filename in timed_out_filenames:
-        search_name = savvy_display_name(filename)
         status = None
 
         for attempt in range(RETRY_POLLS):
-            status = check_file_status_on_page(page, search_name)
+            status = check_file_status_on_page(page, filename)
             if status:
                 break
             log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} still processing...")
@@ -863,7 +869,6 @@ def run(
             # --- Upload each file ---
             for i, csv_path in enumerate(csv_files, 1):
                 filename = Path(csv_path).name
-                search_name = savvy_display_name(csv_path)
                 result = UploadResult(filename=filename)
                 log.info(f"[{i}/{len(csv_files)}] Uploading: {filename}")
 
@@ -872,7 +877,7 @@ def run(
                     log.info("File selected, waiting for upload to process...")
                     time.sleep(5)
 
-                    status = poll_upload_status(page, search_name)
+                    status = poll_upload_status(page, filename)
                     result.status = status
                     log.info(f"[{i}/{len(csv_files)}] {filename} -> {status}")
 
