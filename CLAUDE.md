@@ -81,7 +81,7 @@ Recommended production deployment is as a systemd service running `savvy_watch.s
 
 **Rejected flight attribution:** Scrapes the "Rejected" panel after each upload. Tracks a baseline of pre-existing rejected flights so only *new* rejections are attributed to each file.
 
-**Cleanup:** Deletes old CSVs after upload, always keeping the 10 most recent + any pending files.
+**Cleanup:** Moves uploaded CSVs out of `CSV_DIR` into `ARCHIVE_DIR` (defaults to `<CSV_DIR>/../archive`), keeping the 10 most recent + any pending files in `CSV_DIR`. Archive is keep-forever; nothing is deleted.
 
 ## Code conventions
 

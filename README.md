@@ -1,4 +1,4 @@
- # Savvy Upload
+# Savvy Upload
 
 Automatically upload engine monitor CSV files to [SavvyAviation.com](https://savvyaviation.com) using browser automation (Playwright).
 
@@ -12,7 +12,7 @@ Designed to run unattended on a headless Linux box. Drop CSV files into a direct
 - Scrapes rejected flights from Savvy's upload page and attributes them per-file
 - Verifies uploaded files appear on the flights page
 - Sends an email report via `msmtp` (or prints to terminal if unavailable)
-- Cleans up old CSVs after successful upload (keeps the 10 most recent)
+- Archives uploaded CSVs (keeps the 10 most recent in `CSV_DIR`)
 - File watcher mode using `inotifywait` for instant uploads when new files appear
 
 ## Requirements
@@ -43,6 +43,9 @@ SAVVY_EMAIL=you@example.com
 SAVVY_PASSWORD=yourpassword
 SAVVY_AIRCRAFT_ID=12345
 CSV_DIR=/path/to/engine/csv/files
+
+# Optional: archive uploaded CSVs to a separate directory (defaults to <CSV_DIR>/../archive).
+# ARCHIVE_DIR=/path/to/archive
 ```
 
 | Variable | Required | Description |
@@ -51,6 +54,7 @@ CSV_DIR=/path/to/engine/csv/files
 | `SAVVY_PASSWORD` | Yes | Your SavvyAviation password |
 | `SAVVY_AIRCRAFT_ID` | Yes | Your aircraft's numeric ID from the Savvy URL |
 | `CSV_DIR` | Yes | Directory where engine monitor CSVs are stored |
+| `ARCHIVE_DIR` | No | Where uploaded CSVs are moved to after upload (defaults to `<CSV_DIR>/../archive`). Files are never deleted. |
 | `USER_AGENT` | No | Custom browser user agent (defaults to Chrome 131 on Linux x86_64) |
 | `LAST_UPLOADED` | Auto | Managed by the script - tracks the most recent uploaded file |
 
@@ -162,8 +166,25 @@ Configure `~/.msmtprc` with your email provider's SMTP settings. See the [msmtp 
 5. After each successful upload, checks for newly rejected flights
 6. Navigates to the flights page to verify uploads appeared
 7. Updates the `LAST_UPLOADED` watermark in `.env`
-8. Deletes successfully uploaded CSVs, keeping the 10 most recent
+8. Archives successfully uploaded CSVs (keeps the 10 most recent in `CSV_DIR`)
 9. Sends an email summary (or prints to terminal)
+
+## Deploying updates
+
+Once the system is running on a remote host (e.g. an always-on Linux box), run `deploy.sh` from your laptop to pull main on the host in one command:
+
+```bash
+export SAVVY_DEPLOY_HOST=your-ssh-alias    # set once in your shell profile
+./deploy.sh                                # pulls main on the host, verifies the service
+./deploy.sh another-host                   # one-off override
+```
+
+The script prints exactly one final line — `[deploy] DEPLOY OK …` on success, `[deploy] DEPLOY FAILED step="…"` on a known failure, or `[deploy] DEPLOY DID NOT COMPLETE …` if it died silently mid-run. Don't trust a deploy report (yours or an agent's) that doesn't quote one of those back at you.
+
+## Related projects
+
+- [flashair-sync](https://github.com/leithl/flashair-sync) — Raspberry Pi that pulls CSVs off the FlashAir SD card in the engine monitor and SCPs them to this project's `CSV_DIR`.
+- `leithl/landing-lab` — companion analysis project that watches the archive dir, parses the same CSVs into a `landings.json`, and renders a static stats page. (Private repo.)
 
 ## CSV file naming
 
@@ -179,5 +200,6 @@ The script expects engine monitor CSV files named `log_YYYYMMDD_HHMMSS_AIRPORT.c
 | `savvy_upload.py` | Main upload script |
 | `savvy_cron.sh` | Shell wrapper for manual/cron runs |
 | `savvy_watch.sh` | File watcher using inotifywait |
+| `savvy_download.py` | Backfill: pulls every CSV Savvy has for the aircraft into `ARCHIVE_DIR` |
+| `deploy.sh` | One-command deploy from your laptop (pulls latest on the host, verifies the service). |
 | `.env` | Configuration (not checked into git) |
-| `.gitignore` | Excludes `.env`, `venv/`, logs, debug screenshots |

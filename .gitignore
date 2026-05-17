@@ -4,3 +4,7 @@ csvs/
 *.log
 debug_*.png
 __pycache__/
+
+# Runtime state
+pending_uploads.json
+unsent_email.json
