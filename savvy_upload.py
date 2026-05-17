@@ -99,6 +99,62 @@ class UploadResult:
 # ---------------------------------------------------------------------------
 ENV_FILE = Path(__file__).parent / ".env"
 
+# Savvy GraphQL query that returns every engine-data FILE (not just files
+# that produced a Flight). Critical distinction: Savvy reports "Success
+# (0 flights)" for any file that doesn't contain a complete takeoff+landing
+# cycle (e.g. pre-flight engine runs, files that got uploaded partway
+# through a flight). Those files ARE on Savvy — they just don't appear in
+# the flights view, which is how the earlier silent-loss bug masked them.
+SAVVY_FILES_QUERY = """query AircraftEngineDataFiles($id: Int) {
+  me { id aircraft(id: $id) {
+    id
+    engineDataFiles { id name __typename }
+  } }
+}"""
+
+# Upload-page status strings that mean Savvy positively acknowledged the
+# file. Anything else (timeouts, raw filename-fragments, "Error", etc.) is
+# treated as unverified and the file is kept for retry.
+SAVVY_ACCEPTED_PREFIXES = ("Success", "File Duplicated", "Processed")
+
+
+def fetch_savvy_filenames(api_ctx, aircraft_id: str):
+    """Return the set of CSV filenames Savvy has (any status, with or
+    without a Flight extracted). None on error (caller treats as 'unknown').
+    """
+    try:
+        resp = api_ctx.post(
+            f"{SAVVY_BASE}/graphql",
+            data=json.dumps({
+                "operationName": "AircraftEngineDataFiles",
+                "variables": {"id": int(aircraft_id)},
+                "query": SAVVY_FILES_QUERY,
+            }),
+            headers={"content-type": "application/json"},
+        )
+        if resp.status != 200:
+            log.warning(f"GraphQL verification HTTP {resp.status}")
+            return None
+        data = resp.json().get("data") or {}
+        acft = (data.get("me") or {}).get("aircraft") or []
+        if not acft:
+            return set()
+        edfs = acft[0].get("engineDataFiles") or []
+        return {e["name"] for e in edfs if e.get("name")}
+    except Exception as e:
+        log.warning(f"GraphQL verification failed: {e}")
+        return None
+
+
+def status_looks_accepted(status: str) -> bool:
+    """True if the upload-page status indicates Savvy received the file
+    successfully. Catches both 'Success' (with or without flight count)
+    and 'File Duplicated' (Savvy already has it). Rejects bogus statuses
+    like raw filename fragments or 'unknown'."""
+    if not status:
+        return False
+    return any(status.startswith(p) for p in SAVVY_ACCEPTED_PREFIXES)
+
 
 def _read_env() -> dict[str, str]:
     """Read key=value pairs from the .env file."""
@@ -667,15 +723,28 @@ def compose_email(
     if n_still_pending:
         lines.append(f"  Still pending verification: {n_still_pending}")
 
+    # Loud banner if any file reported "success" by the upload page but is
+    # not actually visible in Savvy's flights list. That's the silent-loss
+    # bug we got bitten by; surface it so we never miss again.
+    unverified = [r for r in results if not r.on_flights_page]
+    if unverified:
+        lines += [
+            "",
+            "*" * 70,
+            f"WARNING: {len(unverified)} uploaded file(s) NOT on Savvy.",
+            f"They've been kept in CSV_DIR for retry on the next run:",
+        ]
+        for r in unverified:
+            lines.append(f"  - {r.filename}  (status was: {r.status!r})")
+        lines.append("*" * 70)
+
     lines += [
         "",
         "File Details:",
         "-" * 70,
     ]
     for r in results:
-        flights_note = ""
-        if r.on_flights_page:
-            flights_note = " (verified on flights page)"
+        flights_note = " (verified on Savvy)" if r.on_flights_page else " !! NOT on Savvy"
         lines.append(f"  {r.filename}")
         lines.append(f"    Status: {r.status}{flights_note}")
 
@@ -949,19 +1018,46 @@ def run(
                 # Any files still not resolved go to persistent pending list
                 pending_filenames.extend(retry_still_pending)
 
-            # --- Verify on flights page ---
+            # --- Verify uploads landed on Savvy ---
+            # Dual-signal verification:
+            #   1. GraphQL AircraftEngineDataFiles — Savvy's authoritative
+            #      list of files it has (regardless of whether they produced
+            #      a Flight). Files reported as "Success (0 flights)" still
+            #      appear here.
+            #   2. Upload-page status string — if Savvy explicitly returned
+            #      "Success*" or "File Duplicated", we trust that too. This
+            #      handles the case where GraphQL is briefly out of sync
+            #      with what was just uploaded (Savvy might take a few
+            #      seconds to surface the new file).
+            # A file is verified if EITHER signal says yes. Both signals
+            # have to fail for us to mark it unverified.
             all_to_verify = results + verified_results
-            log.info(f"Navigating to flights page: {cfg.flights_url}")
-            page.goto(cfg.flights_url, wait_until="domcontentloaded")
-            time.sleep(3)
-            page.screenshot(path=str(DEBUG_DIR / "debug_flights_page.png"))
-
-            flights_body = page.inner_text("body")
+            log.info("Querying Savvy GraphQL for authoritative file list...")
+            savvy_files = fetch_savvy_filenames(ctx.request, cfg.aircraft_id)
+            graphql_ok = savvy_files is not None
+            if not graphql_ok:
+                log.warning("GraphQL verification unavailable; falling back to flights-page text + status check.")
+                page.goto(cfg.flights_url, wait_until="domcontentloaded")
+                time.sleep(3)
+                page.screenshot(path=str(DEBUG_DIR / "debug_flights_page.png"))
+                flights_body = page.inner_text("body")
+            else:
+                log.info(f"Savvy reports {len(savvy_files)} files for this aircraft.")
             for r in all_to_verify:
-                # Flights page shows full filename (e.g. log_20260213_114814_KANK.csv)
-                if r.filename in flights_body:
+                in_savvy = graphql_ok and (r.filename in savvy_files)
+                status_ok = status_looks_accepted(r.status)
+                text_ok = (not graphql_ok) and (r.filename in flights_body)
+                if in_savvy or status_ok or text_ok:
                     r.on_flights_page = True
-                    log.info(f"  Verified on flights page: {r.filename}")
+                    reason = ("graphql" if in_savvy else
+                              "status='%s'" % r.status if status_ok else "text-scrape")
+                    log.info(f"  Verified ({reason}): {r.filename}")
+                else:
+                    log.warning(
+                        f"  NOT on Savvy: {r.filename} "
+                        f"(status reported by upload page: {r.status!r}). "
+                        f"Will keep local copy for retry."
+                    )
 
             page.screenshot(path=str(DEBUG_DIR / "debug_final.png"))
 
@@ -979,15 +1075,41 @@ def run(
     save_pending_uploads(pending_filenames)
 
     # --- Update watermark ---
-    # Advance to the newest file we attempted, so we don't retry it.
-    if results:
-        newest = max(r.filename for r in results)
-        save_last_uploaded(newest)
+    # Advance only across the longest CONTIGUOUS verified prefix of this
+    # run's results. Stopping at the first unverified file means subsequent
+    # runs will retry it (and any later files re-uploaded by then will be
+    # flagged by Savvy as duplicates, which is fine).
+    #
+    # Pre-fix behaviour was: advance to the newest attempted file regardless
+    # of verification. That silently dropped files Savvy never received
+    # (e.g. log_20260416_101401_KLMO.csv on 2026-04-16: upload page reported
+    # the bogus '_KLMO.csv' status, watermark advanced past it, file got
+    # cleaned up locally, never seen again).
+    sorted_results = sorted(results + verified_results, key=lambda r: r.filename)
+    new_watermark = None
+    for r in sorted_results:
+        if r.on_flights_page:
+            new_watermark = r.filename
+        else:
+            break
+    if new_watermark:
+        save_last_uploaded(new_watermark)
+        log.info(f"Watermark advanced to last contiguous-verified: {new_watermark}")
+
+    unverified_attempted = [r.filename for r in results if not r.on_flights_page]
+    if unverified_attempted:
+        log.warning(
+            f"{len(unverified_attempted)} file(s) NOT verified on Savvy "
+            f"and will be retried next run: {unverified_attempted}"
+        )
 
     # --- Clean up already-uploaded CSVs ---
+    # Unverified files are added to the pending set so cleanup leaves them
+    # in CSV_DIR for retry.
     watermark = load_last_uploaded()
     n_cleaned = cleanup_csvs(
-        cfg.csv_dir, watermark, keep_recent=10, pending_filenames=pending_filenames,
+        cfg.csv_dir, watermark, keep_recent=10,
+        pending_filenames=list(set(pending_filenames) | set(unverified_attempted)),
     ) if watermark else 0
 
     # --- Email summary ---
