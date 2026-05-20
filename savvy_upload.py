@@ -1068,7 +1068,7 @@ def run(
             # have to fail for us to mark it unverified.
             all_to_verify = results + verified_results
             log.info("Querying Savvy GraphQL for authoritative file list...")
-            savvy_files = fetch_savvy_filenames(ctx.request, cfg.aircraft_id)
+            savvy_files = fetch_savvy_filenames(context.request, cfg.aircraft_id)
             graphql_ok = savvy_files is not None
             if not graphql_ok:
                 log.warning("GraphQL verification unavailable; falling back to flights-page text + status check.")
