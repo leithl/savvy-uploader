@@ -1041,6 +1041,11 @@ def run(
     # (e.g. log_20260416_101401_KLMO.csv on 2026-04-16: upload page reported
     # the bogus '_KLMO.csv' status, watermark advanced past it, file got
     # cleaned up locally, never seen again).
+    #
+    # The watermark also only ever moves FORWARD. --reupload runs (especially
+    # on a single old file passed as a path arg) would otherwise rewrite the
+    # watermark backward to that old filename, making the next normal run
+    # re-attempt every file uploaded since.
     sorted_results = sorted(results + verified_results, key=lambda r: r.filename)
     new_watermark = None
     for r in sorted_results:
@@ -1049,8 +1054,15 @@ def run(
         else:
             break
     if new_watermark:
-        save_last_uploaded(new_watermark)
-        log.info(f"Watermark advanced to last contiguous-verified: {new_watermark}")
+        current_watermark = load_last_uploaded()
+        if new_watermark > current_watermark:
+            save_last_uploaded(new_watermark)
+            log.info(f"Watermark advanced to last contiguous-verified: {new_watermark}")
+        else:
+            log.info(
+                f"Watermark unchanged ({current_watermark}); "
+                f"last contiguous-verified ({new_watermark}) is not newer."
+            )
 
     unverified_attempted = [r.filename for r in results if not r.on_flights_page]
     if unverified_attempted:
