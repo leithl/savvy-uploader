@@ -8,3 +8,10 @@ __pycache__/
 # Runtime state
 pending_uploads.json
 unsent_email.json
+
+# Co-tenant runtime: a separate process consumes BMP screenshots from
+# the same data card, staging here before its own upload. Sibling dirs
+# of csvs/; not savvy-uploader's data, just co-located.
+shots/
+shots-uploaded/
+shots-failed/
