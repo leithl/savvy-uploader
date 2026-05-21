@@ -4,9 +4,11 @@ Headless browser automation tool that uploads engine monitor CSV files to SavvyA
 
 ## Relationship to flashair-sync
 
-This is the second stage of a two-stage pipeline. [flashair-sync](https://github.com/leithl/flashair-sync) runs on a Raspberry Pi, downloads CSVs from a FlashAir WiFi SD card in the aircraft's engine monitor, and SCPs them to a remote server. This project picks up those files and uploads them to SavvyAviation. The handoff is the filesystem: flashair-sync's `REMOTE_DIR` is this project's `CSV_DIR`.
+Second stage of a two-project pipeline. [flashair-sync](https://github.com/leithl/flashair-sync) runs on a Raspberry Pi, downloads CSVs from the engine monitor's FlashAir WiFi SD card, and SCPs them to `CSV_DIR`. This project picks up those files and uploads them to SavvyAviation.
 
-Both projects share a filename-based watermark pattern (lexicographic comparison of `log_YYYYMMDD_HHMMSS_KXXX.csv` filenames) and nearly identical `.env` read/write helpers.
+**Files stay in CSV_DIR forever — savvy-uploader does not move them.** The `LAST_UPLOADED` watermark in `.env` is the only state distinguishing "uploaded" from "pending"; the filesystem layout doesn't carry that information. This also makes `CSV_DIR` safe for any other consumer to read concurrently: savvy-uploader is read-only on each CSV after upload, and read-only readers won't race against its processing.
+
+Both projects use a filename-based watermark pattern (lexicographic comparison of `log_YYYYMMDD_HHMMSS_KXXX.csv` filenames) and near-identical `.env` read/write helpers.
 
 ## Project structure
 
@@ -66,9 +68,11 @@ Recommended production deployment is as a systemd service running `savvy_watch.s
 
 ## Architecture and key patterns
 
-**Entry flow:** Shell wrappers → `savvy_upload.py:main()` → launch Playwright → login → upload loop → verify → email → cleanup.
+**Entry flow:** Shell wrappers → `savvy_upload.py:main()` → launch Playwright → login → upload loop → verify → email. No file movement at any stage.
 
-**Watermark system:** `LAST_UPLOADED` in `.env` tracks the most recently uploaded filename. Files are sorted lexicographically; anything `<= LAST_UPLOADED` is skipped. This works because filenames follow `log_YYYYMMDD_HHMMSS_KXXX.csv` format (chronological = alphabetical).
+**Files never move.** `CSV_DIR` is the permanent home. The only state tracking "what's done" is the `LAST_UPLOADED` watermark in `.env`; files stay put. This also makes the dir safe for any other consumer to read concurrently — no storage-policy coordination needed.
+
+**Watermark system:** `LAST_UPLOADED` in `.env` tracks the most recently uploaded filename. Files are sorted lexicographically; anything `<= LAST_UPLOADED` is skipped. Works because filenames follow `log_YYYYMMDD_HHMMSS_KXXX.csv` format (chronological = alphabetical).
 
 **Three-layer retry for uploads:**
 1. Initial poll — up to 5 minutes per file (`UPLOAD_TIMEOUT`)
@@ -81,7 +85,14 @@ Recommended production deployment is as a systemd service running `savvy_watch.s
 
 **Rejected flight attribution:** Scrapes the "Rejected" panel after each upload. Tracks a baseline of pre-existing rejected flights so only *new* rejections are attributed to each file.
 
-**Cleanup:** Moves uploaded CSVs out of `CSV_DIR` into `ARCHIVE_DIR` (defaults to `<CSV_DIR>/../archive`), keeping the 10 most recent + any pending files in `CSV_DIR`. Archive is keep-forever; nothing is deleted.
+## Public repo — keep contributions standalone
+
+This repo is public on GitHub. PRs, commit messages, code comments, log strings, and docs must be readable to someone with no context beyond this repo:
+
+- **No references to private downstream consumers**, regardless of who owns them. If a change is motivated by a downstream project, frame it in standalone terms ("files stay in `CSV_DIR` for downstream consumers") without naming or linking the downstream.
+- **No PII or operational context**: no hostnames, no usernames in paths, no SSH aliases, no real aircraft IDs, no real watermark values. Use placeholders (`/path/to/csvs`, `user@host:`) and generic terms.
+- **PR test plans must be reproducible cold** by someone setting up this repo fresh — not "run on my host". Generic commands only; never "ssh my-host && …".
+- **Public ↔ public cross-references are fine.** [flashair-sync](https://github.com/leithl/flashair-sync) is also public and is named here as part of the documented pipeline. The rule is one-way: PUBLIC repos must not reference PRIVATE repos.
 
 ## Code conventions
 

@@ -203,7 +203,6 @@ class Config:
     password: str
     aircraft_id: str
     csv_dir: str
-    archive_dir: str = ""
     user_agent: str = DEFAULT_USER_AGENT
     upload_url: str = ""
     flights_url: str = ""
@@ -227,7 +226,6 @@ def load_config(cli_path: str = "") -> Config:
     password = _get("SAVVY_PASSWORD")
     aircraft_id = _get("SAVVY_AIRCRAFT_ID")
     csv_dir = cli_path or _get("CSV_DIR")
-    archive_dir = _get("ARCHIVE_DIR")
     user_agent = _get("USER_AGENT") or DEFAULT_USER_AGENT
 
     if not email or not password:
@@ -240,16 +238,11 @@ def load_config(cli_path: str = "") -> Config:
         log.error("No CSV path provided. Pass a path argument or set CSV_DIR in .env.")
         sys.exit(1)
 
-    # Default archive_dir to a sibling of csv_dir
-    if not archive_dir and Path(csv_dir).is_dir():
-        archive_dir = str(Path(csv_dir).parent / "archive")
-
     return Config(
         email=email,
         password=password,
         aircraft_id=aircraft_id,
         csv_dir=csv_dir,
-        archive_dir=archive_dir,
         user_agent=user_agent,
     )
 
@@ -310,73 +303,6 @@ def _text_after_filename(body_text: str, filename: str) -> str | None:
             tail = body_text.split(prefix, 1)[-1]
             return re.sub(r"^_[A-Z0-9]+(\.csv)?\b", "", tail)[:200]
     return None
-
-
-def cleanup_csvs(
-    directory: str,
-    watermark: str,
-    archive_dir: str = "",
-    keep_recent: int = 10,
-    pending_filenames: list[str] | None = None,
-) -> int:
-    """Move already-uploaded CSVs to *archive_dir*, keeping the most recent
-    *keep_recent* in *directory*.
-
-    Any CSV whose filename sorts <= *watermark* is considered uploaded.
-    Files in *pending_filenames* are kept in *directory* until verified.
-    Falls back to deletion only if *archive_dir* is empty (legacy behavior).
-    Returns the number of files moved/deleted.
-    """
-    p = Path(directory).resolve()
-    if not p.is_dir():
-        return 0
-
-    pending_set = set(pending_filenames or [])
-    all_csvs = sorted(p.glob("log_*_*.csv"), key=lambda f: f.name)
-    protected = {f.name for f in all_csvs[-keep_recent:]}
-
-    archive_path: Path | None = None
-    if archive_dir:
-        archive_path = Path(archive_dir).resolve()
-        archive_path.mkdir(parents=True, exist_ok=True)
-
-    moved = 0
-    for f in all_csvs:
-        if f.name <= watermark and f.name not in protected and f.name not in pending_set:
-            if archive_path is not None:
-                dest = archive_path / f.name
-                # If a file with the same name already exists in archive,
-                # don't overwrite — just remove the redundant copy.
-                if dest.exists():
-                    if f.stat().st_size == dest.stat().st_size:
-                        f.unlink()
-                        log.info(f"Archived (already present): {f.name}")
-                    else:
-                        # Size mismatch — keep both with a suffix
-                        i = 1
-                        while True:
-                            alt = archive_path / f"{f.stem}.dup{i}{f.suffix}"
-                            if not alt.exists():
-                                shutil.move(str(f), str(alt))
-                                log.info(f"Archived as {alt.name} (collision)")
-                                break
-                            i += 1
-                else:
-                    shutil.move(str(f), str(dest))
-                    log.info(f"Archived: {f.name} -> {archive_path}")
-                moved += 1
-            else:
-                f.unlink()
-                log.info(f"Cleaned up: {f.name}")
-                moved += 1
-        elif f.name in pending_set:
-            log.info(f"Kept (pending verification): {f.name}")
-
-    if moved:
-        action = "Archived" if archive_path is not None else "Deleted"
-        log.info(f"{action} {moved} uploaded CSV(s), kept {min(len(all_csvs), keep_recent)} most recent.")
-
-    return moved
 
 
 def collect_csv_files(path: str, after: str = "") -> tuple[list[str], list[str]]:
@@ -718,10 +644,8 @@ def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadRe
 def compose_email(
     results: list[UploadResult],
     n_skipped: int = 0,
-    n_cleaned: int = 0,
     n_verified: int = 0,
     n_still_pending: int = 0,
-    archived: bool = True,
 ) -> tuple[str, str]:
     """Build an email subject and body summarising the upload run."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -752,9 +676,6 @@ def compose_email(
         lines.append(f"  Verified from previous run: {n_verified}")
     if n_skipped:
         lines.append(f"  Skipped (already uploaded): {n_skipped}")
-    if n_cleaned:
-        verb = "archived" if archived else "deleted"
-        lines.append(f"  Cleanup: {n_cleaned} old CSV(s) {verb}")
     if n_still_pending:
         lines.append(f"  Still pending verification: {n_still_pending}")
 
@@ -1138,22 +1059,16 @@ def run(
             f"and will be retried next run: {unverified_attempted}"
         )
 
-    # --- Move verified CSVs to archive; leave unverified in CSV_DIR ---
-    watermark = load_last_uploaded()
-    n_cleaned = cleanup_csvs(
-        cfg.csv_dir, watermark,
-        archive_dir=cfg.archive_dir,
-        keep_recent=10,
-        pending_filenames=list(set(pending_filenames) | set(unverified_attempted)),
-    ) if watermark else 0
-
     # --- Email summary ---
+    # No file movement: uploaded CSVs stay in CSV_DIR (permanent home).
+    # LAST_UPLOADED watermark is the only state tracking "what's done"; any
+    # downstream consumer reading the same dir does so safely. Files that timed
+    # out / didn't verify are tracked by pending_filenames for retry next run.
     all_results = verified_results + results
     n_verified = len(verified_results)
     subject, body = compose_email(
-        all_results, n_skipped=n_skipped, n_cleaned=n_cleaned, n_verified=n_verified,
+        all_results, n_skipped=n_skipped, n_verified=n_verified,
         n_still_pending=len(pending_filenames),
-        archived=bool(cfg.archive_dir),
     )
     send_email(subject, body, cfg.email)
     log.info("All done.")

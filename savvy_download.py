@@ -1,9 +1,8 @@
-"""Download historical CSV files from SavvyAviation.com into a local archive.
+"""Download historical CSV files from SavvyAviation.com into the local CSV_DIR.
 
 Reuses the login flow from savvy_upload.py. Discovers files via the
 FlightsByAircraft GraphQL query, fetches a presigned S3 URL for each via
-EdfDownloadUrl, then saves the CSV to the archive directory (skipping any
-already present).
+EdfDownloadUrl, then saves the CSV to CSV_DIR (skipping any already present).
 
 Usage
 -----
@@ -12,7 +11,7 @@ Usage
     python3 savvy_download.py --dry-run    # list what would be downloaded
     python3 savvy_download.py --since 2026-03  # filter by upload date prefix
 
-Reads SAVVY_EMAIL / SAVVY_PASSWORD / SAVVY_AIRCRAFT_ID / ARCHIVE_DIR from .env
+Reads SAVVY_EMAIL / SAVVY_PASSWORD / SAVVY_AIRCRAFT_ID / CSV_DIR from .env
 (same file as savvy_upload.py).
 """
 import argparse
@@ -145,8 +144,8 @@ def download_csv(api_ctx, url: str, dest: Path) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive-dir", default=None,
-                        help="Override ARCHIVE_DIR for this run")
+    parser.add_argument("--csv-dir", default=None,
+                        help="Override CSV_DIR for this run")
     parser.add_argument("--limit", type=int, default=0,
                         help="Only download N most recent (0 = all)")
     parser.add_argument("--since", default="",
@@ -162,12 +161,12 @@ def main():
         log.error("SAVVY_AIRCRAFT_ID not set")
         sys.exit(1)
 
-    archive_dir = Path(args.archive_dir or cfg.archive_dir)
-    if not archive_dir:
-        log.error("No archive directory. Set ARCHIVE_DIR in .env or use --archive-dir.")
+    csv_dir = Path(args.csv_dir or cfg.csv_dir)
+    if not csv_dir:
+        log.error("No CSV directory. Set CSV_DIR in .env or use --csv-dir.")
         sys.exit(1)
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    log.info(f"Archive directory: {archive_dir}")
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    log.info(f"CSV directory: {csv_dir}")
 
     aircraft_id = int(cfg.aircraft_id)
 
@@ -206,7 +205,7 @@ def main():
         to_get = []
         existing = 0
         for f in files:
-            dest = archive_dir / f["file_name"]
+            dest = csv_dir / f["file_name"]
             if dest.exists() and not args.force:
                 existing += 1
                 continue
@@ -223,7 +222,7 @@ def main():
         n_ok = 0
         n_fail = 0
         for i, f in enumerate(to_get, start=1):
-            dest = archive_dir / f["file_name"]
+            dest = csv_dir / f["file_name"]
             try:
                 url = get_download_url(api, f["file_id"])
                 size = download_csv(api, url, dest)

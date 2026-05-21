@@ -20,8 +20,8 @@
 #
 #   [Service]
 #   Type=simple
-#   User=leith
-#   ExecStart=/home/leith/savvy/savvy_watch.sh
+#   User=youruser
+#   ExecStart=/path/to/savvy-upload/savvy_watch.sh
 #   Restart=on-failure
 #   RestartSec=30
 #

@@ -2,7 +2,7 @@
 
 Automatically upload engine monitor CSV files to [SavvyAviation.com](https://savvyaviation.com) using browser automation (Playwright).
 
-Designed to run unattended on a headless Linux box. Drop CSV files into a directory and they get uploaded, verified, and cleaned up automatically. You get an email summary of what happened.
+Designed to run unattended on a headless Linux box. Drop CSV files into a directory and they get uploaded and verified automatically. You get an email summary of what happened.
 
 ## Features
 
@@ -12,8 +12,8 @@ Designed to run unattended on a headless Linux box. Drop CSV files into a direct
 - Scrapes rejected flights from Savvy's upload page and attributes them per-file
 - Verifies uploaded files appear on the flights page
 - Sends an email report via `msmtp` (or prints to terminal if unavailable)
-- Archives uploaded CSVs (keeps the 10 most recent in `CSV_DIR`)
 - File watcher mode using `inotifywait` for instant uploads when new files appear
+- Files stay in `CSV_DIR` forever — no archive shuffling, friendly to downstream consumers that may read the same dir
 
 ## Requirements
 
@@ -43,9 +43,6 @@ SAVVY_EMAIL=you@example.com
 SAVVY_PASSWORD=yourpassword
 SAVVY_AIRCRAFT_ID=12345
 CSV_DIR=/path/to/engine/csv/files
-
-# Optional: archive uploaded CSVs to a separate directory (defaults to <CSV_DIR>/../archive).
-# ARCHIVE_DIR=/path/to/archive
 ```
 
 | Variable | Required | Description |
@@ -53,10 +50,9 @@ CSV_DIR=/path/to/engine/csv/files
 | `SAVVY_EMAIL` | Yes | Your SavvyAviation login email |
 | `SAVVY_PASSWORD` | Yes | Your SavvyAviation password |
 | `SAVVY_AIRCRAFT_ID` | Yes | Your aircraft's numeric ID from the Savvy URL |
-| `CSV_DIR` | Yes | Directory where engine monitor CSVs are stored |
-| `ARCHIVE_DIR` | No | Where uploaded CSVs are moved to after upload (defaults to `<CSV_DIR>/../archive`). Files are never deleted. |
+| `CSV_DIR` | Yes | Directory holding engine monitor CSVs. Files arrive here (via SCP from flashair-sync or manual drop) and stay forever — savvy-uploader does not move them. |
 | `USER_AGENT` | No | Custom browser user agent (defaults to Chrome 131 on Linux x86_64) |
-| `LAST_UPLOADED` | Auto | Managed by the script - tracks the most recent uploaded file |
+| `LAST_UPLOADED` | Auto | Managed by the script — tracks the most recent uploaded file (the only state distinguishing uploaded vs. pending files in `CSV_DIR`). |
 
 To find your aircraft ID, go to your aircraft's page on SavvyAviation and look at the URL:
 `https://apps.savvyaviation.com/flights/aircraft/12345` - the number at the end is your ID.
@@ -166,8 +162,9 @@ Configure `~/.msmtprc` with your email provider's SMTP settings. See the [msmtp 
 5. After each successful upload, checks for newly rejected flights
 6. Navigates to the flights page to verify uploads appeared
 7. Updates the `LAST_UPLOADED` watermark in `.env`
-8. Archives successfully uploaded CSVs (keeps the 10 most recent in `CSV_DIR`)
-9. Sends an email summary (or prints to terminal)
+8. Sends an email summary (or prints to terminal)
+
+Files stay in `CSV_DIR` permanently — the watermark is the only state distinguishing uploaded from pending. Any downstream consumer reading the same directory does so safely (savvy-uploader is read-only on each CSV after upload).
 
 ## Deploying updates
 
@@ -184,7 +181,6 @@ The script prints exactly one final line — `[deploy] DEPLOY OK …` on success
 ## Related projects
 
 - [flashair-sync](https://github.com/leithl/flashair-sync) — Raspberry Pi that pulls CSVs off the FlashAir SD card in the engine monitor and SCPs them to this project's `CSV_DIR`.
-- `leithl/landing-lab` — companion analysis project that watches the archive dir, parses the same CSVs into a `landings.json`, and renders a static stats page. (Private repo.)
 
 ## CSV file naming
 
@@ -200,6 +196,6 @@ The script expects engine monitor CSV files named `log_YYYYMMDD_HHMMSS_AIRPORT.c
 | `savvy_upload.py` | Main upload script |
 | `savvy_cron.sh` | Shell wrapper for manual/cron runs |
 | `savvy_watch.sh` | File watcher using inotifywait |
-| `savvy_download.py` | Backfill: pulls every CSV Savvy has for the aircraft into `ARCHIVE_DIR` |
+| `savvy_download.py` | Backfill: pulls every CSV Savvy has for the aircraft into `CSV_DIR` |
 | `deploy.sh` | One-command deploy from your laptop (pulls latest on the host, verifies the service). |
 | `.env` | Configuration (not checked into git) |
