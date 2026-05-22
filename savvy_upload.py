@@ -62,6 +62,11 @@ DEBUG_DIR = Path(__file__).parent
 PENDING_FILE = DEBUG_DIR / "pending_uploads.json"
 UNSENT_EMAIL_FILE = DEBUG_DIR / "unsent_email.json"
 
+# Bump on any breaking change to the summary dict shape (see
+# build_summary_dict). External consumers of the JSONL sidecar should
+# check this and refuse unknown majors rather than guessing fields.
+SUMMARY_SCHEMA_VERSION = 1
+
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
@@ -203,6 +208,7 @@ class Config:
     password: str
     aircraft_id: str
     csv_dir: str
+    summary_dir: str = ""
     user_agent: str = DEFAULT_USER_AGENT
     upload_url: str = ""
     flights_url: str = ""
@@ -226,6 +232,7 @@ def load_config(cli_path: str = "") -> Config:
     password = _get("SAVVY_PASSWORD")
     aircraft_id = _get("SAVVY_AIRCRAFT_ID")
     csv_dir = cli_path or _get("CSV_DIR")
+    summary_dir = _get("SUMMARY_DIR")
     user_agent = _get("USER_AGENT") or DEFAULT_USER_AGENT
 
     if not email or not password:
@@ -243,6 +250,7 @@ def load_config(cli_path: str = "") -> Config:
         password=password,
         aircraft_id=aircraft_id,
         csv_dir=csv_dir,
+        summary_dir=summary_dir,
         user_agent=user_agent,
     )
 
@@ -639,29 +647,76 @@ def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadRe
 
 
 # ---------------------------------------------------------------------------
-# Email
+# Summary (canonical dict + projections: email body, JSON sidecar)
 # ---------------------------------------------------------------------------
-def compose_email(
+def build_summary_dict(
     results: list[UploadResult],
     n_skipped: int = 0,
     n_verified: int = 0,
-    n_still_pending: int = 0,
-) -> tuple[str, str]:
-    """Build an email subject and body summarising the upload run."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    n_success = sum(1 for r in results if "Success" in r.status)
-    n_dup = sum(1 for r in results if "Duplicated" in r.status)
-    n_err = sum(1 for r in results if r.status.startswith("error"))
-    n_timeout = sum(1 for r in results if r.status == "timeout")
-    n_other = len(results) - n_success - n_dup - n_err - n_timeout
-    total_rejected = sum(len(r.rejected_flights) for r in results)
+    n_pending: int = 0,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Build the canonical summary dict for a single upload run.
 
-    subject = f"Savvy Upload Report - {now} ({len(results)} files)"
+    Both the email renderer and the optional JSON sidecar are projections
+    of this dict — there is one source of truth for what an upload run
+    "looks like" so the two outputs can't drift. Derived stats (n_success,
+    totals) are intentionally NOT pre-computed here; renderers compute
+    them from `files` so the persisted shape stays minimal.
+
+    ``now`` is keyword-only and exists for testability; production callers
+    leave it as ``None`` to capture the current local time.
+    """
+    when = now if now is not None else datetime.now().astimezone()
+    return {
+        "schema_version": SUMMARY_SCHEMA_VERSION,
+        "run_at": when.isoformat(timespec="seconds"),
+        "n_skipped": n_skipped,
+        "n_verified": n_verified,
+        "n_pending": n_pending,
+        "files": [
+            {
+                "filename": r.filename,
+                "status": r.status,
+                "flights_accepted": r.flights_accepted,
+                "on_savvy": r.on_flights_page,
+                "rejected_flights": [
+                    {
+                        "date": rf.date,
+                        "departure": rf.departure,
+                        "destination": rf.destination,
+                        "duration": rf.duration,
+                    }
+                    for rf in r.rejected_flights
+                ],
+            }
+            for r in results
+        ],
+    }
+
+
+def compose_email_from_summary(summary: dict) -> tuple[str, str]:
+    """Render an email subject + plain-text body from the summary dict."""
+    files = summary["files"]
+    n_skipped = summary["n_skipped"]
+    n_verified = summary["n_verified"]
+    n_still_pending = summary["n_pending"]
+
+    now = datetime.fromisoformat(summary["run_at"]).strftime("%Y-%m-%d %H:%M")
+    n_success = sum(1 for f in files if "Success" in f["status"])
+    n_dup = sum(1 for f in files if "Duplicated" in f["status"])
+    n_err = sum(1 for f in files if f["status"].startswith("error"))
+    n_timeout = sum(1 for f in files if f["status"] == "timeout")
+    n_other = len(files) - n_success - n_dup - n_err - n_timeout
+    total_rejected = sum(len(f["rejected_flights"]) for f in files)
+
+    subject = f"Savvy Upload Report - {now} ({len(files)} files)"
 
     lines = [
         "Savvy Aviation Upload Report",
         f"Run at: {now}",
-        f"Files processed: {len(results)}",
+        f"Files processed: {len(files)}",
         f"  Successful: {n_success}",
         f"  Duplicated: {n_dup}",
         f"  Errors:     {n_err}",
@@ -682,7 +737,7 @@ def compose_email(
     # Loud banner if any file reported "success" by the upload page but is
     # not actually visible in Savvy's flights list. That's the silent-loss
     # bug we got bitten by; surface it so we never miss again.
-    unverified = [r for r in results if not r.on_flights_page]
+    unverified = [f for f in files if not f["on_savvy"]]
     if unverified:
         lines += [
             "",
@@ -690,8 +745,8 @@ def compose_email(
             f"WARNING: {len(unverified)} uploaded file(s) NOT on Savvy.",
             f"They've been kept in CSV_DIR for retry on the next run:",
         ]
-        for r in unverified:
-            lines.append(f"  - {r.filename}  (status was: {r.status!r})")
+        for f in unverified:
+            lines.append(f"  - {f['filename']}  (status was: {f['status']!r})")
         lines.append("*" * 70)
 
     lines += [
@@ -699,17 +754,18 @@ def compose_email(
         "File Details:",
         "-" * 70,
     ]
-    for r in results:
-        flights_note = " (verified on Savvy)" if r.on_flights_page else " !! NOT on Savvy"
-        lines.append(f"  {r.filename}")
-        lines.append(f"    Status: {r.status}{flights_note}")
+    for f in files:
+        flights_note = " (verified on Savvy)" if f["on_savvy"] else " !! NOT on Savvy"
+        lines.append(f"  {f['filename']}")
+        lines.append(f"    Status: {f['status']}{flights_note}")
 
-        if r.rejected_flights:
-            lines.append(f"    Rejected flights ({len(r.rejected_flights)}):")
-            for rf in r.rejected_flights:
+        rejected = f["rejected_flights"]
+        if rejected:
+            lines.append(f"    Rejected flights ({len(rejected)}):")
+            for rf in rejected:
                 lines.append(
-                    f"      {rf.date}  {rf.departure} -> {rf.destination}"
-                    f"  ({rf.duration})"
+                    f"      {rf['date']}  {rf['departure']} -> {rf['destination']}"
+                    f"  ({rf['duration']})"
                 )
         lines.append("")
 
@@ -725,6 +781,21 @@ def compose_email(
 
     lines.append("-" * 70)
     return subject, "\n".join(lines)
+
+
+def append_summary_jsonl(summary: dict, summary_dir: str) -> None:
+    """Append the summary as one JSON line to {summary_dir}/savvy-{YYYY-MM-DD}.jsonl.
+
+    Creates the directory if missing. POSIX append is atomic for small
+    writes, so plain "a" mode is sufficient — no temp-file dance needed.
+    """
+    dir_path = Path(summary_dir)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().date().isoformat()
+    out_path = dir_path / f"savvy-{date_str}.jsonl"
+    with out_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(summary) + "\n")
+    log.info(f"Wrote summary to {out_path}")
 
 
 def _try_msmtp(recipient: str, msg: str) -> bool:
@@ -1071,18 +1142,27 @@ def run(
             f"and will be retried next run: {unverified_attempted}"
         )
 
-    # --- Email summary ---
+    # --- Summary (email or JSON sidecar) ---
     # No file movement: uploaded CSVs stay in CSV_DIR (permanent home).
     # LAST_UPLOADED watermark is the only state tracking "what's done"; any
     # downstream consumer reading the same dir does so safely. Files that timed
     # out / didn't verify are tracked by pending_filenames for retry next run.
+    #
+    # build_summary_dict produces the canonical shape; email body and JSON
+    # sidecar are both projections of it. SUMMARY_DIR toggles which output
+    # runs (set = sidecar only, unset = email only).
     all_results = verified_results + results
-    n_verified = len(verified_results)
-    subject, body = compose_email(
-        all_results, n_skipped=n_skipped, n_verified=n_verified,
-        n_still_pending=len(pending_filenames),
+    summary = build_summary_dict(
+        all_results,
+        n_skipped=n_skipped,
+        n_verified=len(verified_results),
+        n_pending=len(pending_filenames),
     )
-    send_email(subject, body, cfg.email)
+    if cfg.summary_dir:
+        append_summary_jsonl(summary, cfg.summary_dir)
+    else:
+        subject, body = compose_email_from_summary(summary)
+        send_email(subject, body, cfg.email)
     log.info("All done.")
 
 

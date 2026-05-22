@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "run_at": "2026-05-21T14:32:14-06:00",
+  "n_skipped": 0,
+  "n_verified": 0,
+  "n_pending": 0,
+  "files": [
+    {
+      "filename": "log_20200101_120000_KAAA.csv",
+      "status": "Success (2 flights)",
+      "flights_accepted": 2,
+      "on_savvy": true,
+      "rejected_flights": []
+    }
+  ]
+}

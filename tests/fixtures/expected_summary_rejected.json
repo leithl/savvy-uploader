@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run_at": "2026-05-21T14:32:14-06:00",
+  "n_skipped": 0,
+  "n_verified": 0,
+  "n_pending": 1,
+  "files": [
+    {
+      "filename": "log_20200103_140000_KCCC.csv",
+      "status": "Success (1 flight)",
+      "flights_accepted": 1,
+      "on_savvy": true,
+      "rejected_flights": [
+        {
+          "date": "2019-04-06",
+          "departure": "Unknown",
+          "destination": "Unknown",
+          "duration": "0h 0m 9s"
+        }
+      ]
+    }
+  ]
+}
