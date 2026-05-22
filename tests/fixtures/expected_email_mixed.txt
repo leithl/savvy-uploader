@@ -1,0 +1,18 @@
+Savvy Aviation Upload Report
+Run at: 2026-05-21 14:32
+Files processed: 2
+  Successful: 1
+  Duplicated: 1
+  Errors:     0
+  Verified from previous run: 1
+  Skipped (already uploaded): 3
+
+File Details:
+----------------------------------------------------------------------
+  log_20200101_120000_KAAA.csv
+    Status: Success (2 flights) (verified on Savvy)
+
+  log_20200102_130000_KBBB.csv
+    Status: File Duplicated (verified on Savvy)
+
+----------------------------------------------------------------------
