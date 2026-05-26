@@ -486,7 +486,9 @@ def extract_status(text_after_name: str) -> str:
     # "Success (Show N Flights)" - capture the full phrase
     m = re.search(r"Success\s*\(Show\s+(\d+)\s+Flights?\)", text_after_name)
     if m:
-        return f"Success ({m.group(1)} flights)"
+        n = int(m.group(1))
+        unit = "flight" if n == 1 else "flights"
+        return f"Success ({n} {unit})"
 
     # Known status phrases
     known = [

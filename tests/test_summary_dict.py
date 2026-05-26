@@ -21,6 +21,7 @@ from savvy_upload import (  # noqa: E402
     UploadResult,
     build_summary_dict,
     compose_email_from_summary,
+    extract_status,
 )
 
 FIXED_TIME = datetime(2026, 5, 21, 14, 32, 14, tzinfo=timezone(timedelta(hours=-6)))
@@ -163,11 +164,39 @@ def test_email_body_pins_to_fixture() -> None:
     )
 
 
+def test_extract_status_success_singular() -> None:
+    _assert_eq(
+        "test_extract_status_success_singular",
+        extract_status("✓  Success (Show 1 Flights)"),
+        "Success (1 flight)",
+    )
+
+
+def test_extract_status_success_plural() -> None:
+    _assert_eq(
+        "test_extract_status_success_plural",
+        extract_status("✓  Success (Show 2 Flights)"),
+        "Success (2 flights)",
+    )
+
+
+def test_extract_status_success_zero_is_plural() -> None:
+    # 0 takes the plural form in English ("0 flights", not "0 flight").
+    _assert_eq(
+        "test_extract_status_success_zero_is_plural",
+        extract_status("✓  Success (Show 0 Flights)"),
+        "Success (0 flights)",
+    )
+
+
 def main() -> None:
     test_success_only()
     test_mixed_success_and_duplicate()
     test_success_with_rejected_flights()
     test_email_body_pins_to_fixture()
+    test_extract_status_success_singular()
+    test_extract_status_success_plural()
+    test_extract_status_success_zero_is_plural()
     print("\nAll tests passed.")
 
 
