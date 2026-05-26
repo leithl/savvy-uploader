@@ -53,6 +53,7 @@ CSV_DIR=/path/to/engine/csv/files
 | `CSV_DIR` | Yes | Directory holding engine monitor CSVs. Files arrive here (via SCP from flashair-sync or manual drop) and stay forever — savvy-uploader does not move them. |
 | `USER_AGENT` | No | Custom browser user agent (defaults to Chrome 131 on Linux x86_64) |
 | `SUMMARY_DIR` | No | If set, each run appends a JSON-line summary to `{SUMMARY_DIR}/savvy-YYYY-MM-DD.jsonl` and **no email is sent**. Useful when an external process aggregates upload outcomes from multiple sources. Leave unset to keep the per-batch email behaviour. |
+| `GRAPHQL_SETTLE_SECONDS` | No | Seconds to wait after the upload phase before the authoritative GraphQL flight-count query (default 60). Savvy parses CSVs asynchronously in multiple phases — flight attribution can land seconds-to-minutes after the upload page first reports "Success". Raise this if the log warns about 0-flight files whose status wasn't terminal-no-flight. |
 | `LAST_UPLOADED` | Auto | Managed by the script — tracks the most recent uploaded file (the only state distinguishing uploaded vs. pending files in `CSV_DIR`). |
 
 To find your aircraft ID, go to your aircraft's page on SavvyAviation and look at the URL:

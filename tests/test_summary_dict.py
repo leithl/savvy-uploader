@@ -248,14 +248,16 @@ class _StubPage:
 
 
 def test_poll_does_not_leak_checking_duplicates_as_final_status() -> None:
-    """With 'Checking Duplicates' on the first poll and 'Success (Show
-    1 Flights)' on the second, the poller must wait for the terminal
-    state — not return 'Checking Duplicates' as the final status."""
+    """With 'Checking Duplicates' on the first poll, the poller must
+    wait for the terminal state — not return 'Checking Duplicates' as
+    the final status. Two consecutive 'Success (Show 1 Flights)' reads
+    are needed to satisfy the stability gate."""
     import savvy_upload  # noqa: PLC0415 — local import to monkey-patch
 
     filename = "log_20200101_120000_KAAA.csv"
     page = _StubPage(inner_texts=[
         f"{filename}\n● ● ● ●   Checking Duplicates",
+        f"{filename}\n✓  Success (Show 1 Flights)",
         f"{filename}\n✓  Success (Show 1 Flights)",
     ])
 
