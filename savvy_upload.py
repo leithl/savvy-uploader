@@ -118,16 +118,28 @@ class UploadResult:
 # ---------------------------------------------------------------------------
 ENV_FILE = Path(__file__).parent / ".env"
 
-# Savvy GraphQL query that returns every engine-data FILE (not just files
-# that produced a Flight). Critical distinction: Savvy reports "Success
-# (0 flights)" for any file that doesn't contain a complete takeoff+landing
-# cycle (e.g. pre-flight engine runs, files that got uploaded partway
-# through a flight). Those files ARE on Savvy — they just don't appear in
-# the flights view, which is how the earlier silent-loss bug masked them.
+# Savvy GraphQL query that returns every engine-data FILE plus every
+# Flight, joined back to its importFile. Two reasons we need both:
+#
+#   1. engineDataFiles is the authoritative list of files Savvy has
+#      received — files reported as "Success (0 flights)" still appear
+#      here. This is what the earlier silent-loss bug missed (we used to
+#      query only `flights`, which hid every flightless file).
+#   2. flights{importFile{name}} lets us count flights per file at query
+#      time, bypassing the upload-page status string entirely. Savvy
+#      parses CSVs asynchronously and the page status can capture a
+#      Phase-2 reading where a flight hasn't been attributed yet (or
+#      has been temporarily mis-attributed). GraphQL after a settle
+#      delay is the source of truth.
 SAVVY_FILES_QUERY = """query AircraftEngineDataFiles($id: Int) {
   me { id aircraft(id: $id) {
     id
-    engineDataFiles { id name __typename }
+    engineDataFiles { id name uploadDate __typename }
+    flights(hideShortFlights: false) {
+      id departureId destinationId duration
+      importFile { id name __typename }
+      __typename
+    }
   } }
 }"""
 
@@ -137,9 +149,19 @@ SAVVY_FILES_QUERY = """query AircraftEngineDataFiles($id: Int) {
 SAVVY_ACCEPTED_PREFIXES = ("Success", "File Duplicated", "Processed")
 
 
-def fetch_savvy_filenames(api_ctx, aircraft_id: str):
-    """Return the set of CSV filenames Savvy has (any status, with or
-    without a Flight extracted). None on error (caller treats as 'unknown').
+def fetch_savvy_file_flight_counts(api_ctx, aircraft_id: str) -> dict[str, int] | None:
+    """Return {filename: flight_count} for every CSV Savvy has for this
+    aircraft. None on transport / parse error (caller falls back to the
+    upload-page status).
+
+    Every file known to Savvy gets an entry (default 0) even if no
+    Flight has been attributed yet — so caller membership check
+    ``name in result`` answers "is this file on Savvy?" while
+    ``result[name]`` answers "how many flights did Savvy attribute to
+    it?". A 0-count can legitimately mean either "pre-flight engine
+    run, no flight expected" OR "Phase-3 attribution hasn't landed
+    yet"; the caller's settle delay before this query is what keeps
+    the second case rare.
     """
     try:
         resp = api_ctx.post(
@@ -157,9 +179,15 @@ def fetch_savvy_filenames(api_ctx, aircraft_id: str):
         data = resp.json().get("data") or {}
         acft = (data.get("me") or {}).get("aircraft") or []
         if not acft:
-            return set()
+            return {}
         edfs = acft[0].get("engineDataFiles") or []
-        return {e["name"] for e in edfs if e.get("name")}
+        counts: dict[str, int] = {e["name"]: 0 for e in edfs if e.get("name")}
+        for f in acft[0].get("flights") or []:
+            imp = f.get("importFile") or {}
+            name = imp.get("name")
+            if name and name in counts:
+                counts[name] += 1
+        return counts
     except Exception as e:
         log.warning(f"GraphQL verification failed: {e}")
         return None
@@ -173,6 +201,30 @@ def status_looks_accepted(status: str) -> bool:
     if not status:
         return False
     return any(status.startswith(p) for p in SAVVY_ACCEPTED_PREFIXES)
+
+
+# Status strings that legitimately mean "this file has no flight and is
+# fully processed" — used by the post-settle GraphQL override to decide
+# whether a 0-flight GraphQL count is benign or suspicious (i.e. Phase-3
+# attribution still in flight). "Success" is intentionally NOT here:
+# "Success (0 flights)" can be a Phase-2 reading that flips later.
+TERMINAL_NO_FLIGHT_PREFIXES = (
+    "File Duplicated",
+    "File Too Small",
+    "File Rejected",
+    "Error",
+    "error",  # the "error: <exception>" path produced by upload exceptions
+)
+
+
+def _is_terminal_no_flight_status(status: str) -> bool:
+    """True if the upload-page status implies the file is fully
+    processed AND legitimately produced no flight. False for anything
+    that could plausibly be a Phase-2 reading (Success, Processed,
+    unknown, timeout)."""
+    if not status:
+        return False
+    return any(status.startswith(p) for p in TERMINAL_NO_FLIGHT_PREFIXES)
 
 
 def _read_env() -> dict[str, str]:
@@ -216,6 +268,9 @@ def _write_env(env: dict[str, str]) -> None:
     ENV_FILE.write_text("\n".join(lines) + "\n")
 
 
+DEFAULT_GRAPHQL_SETTLE_SECONDS = 60
+
+
 @dataclass
 class Config:
     email: str
@@ -224,6 +279,7 @@ class Config:
     csv_dir: str
     summary_dir: str = ""
     user_agent: str = DEFAULT_USER_AGENT
+    graphql_settle_seconds: int = DEFAULT_GRAPHQL_SETTLE_SECONDS
     upload_url: str = ""
     flights_url: str = ""
 
@@ -249,6 +305,16 @@ def load_config(cli_path: str = "") -> Config:
     summary_dir = _get("SUMMARY_DIR")
     user_agent = _get("USER_AGENT") or DEFAULT_USER_AGENT
 
+    settle_raw = _get("GRAPHQL_SETTLE_SECONDS")
+    try:
+        settle = int(settle_raw) if settle_raw else DEFAULT_GRAPHQL_SETTLE_SECONDS
+    except ValueError:
+        log.warning(
+            f"Invalid GRAPHQL_SETTLE_SECONDS={settle_raw!r}; "
+            f"using default {DEFAULT_GRAPHQL_SETTLE_SECONDS}."
+        )
+        settle = DEFAULT_GRAPHQL_SETTLE_SECONDS
+
     if not email or not password:
         log.error("Missing credentials. Set SAVVY_EMAIL and SAVVY_PASSWORD.")
         sys.exit(1)
@@ -266,6 +332,7 @@ def load_config(cli_path: str = "") -> Config:
         csv_dir=csv_dir,
         summary_dir=summary_dir,
         user_agent=user_agent,
+        graphql_settle_seconds=settle,
     )
 
 
@@ -473,11 +540,24 @@ def _is_terminal_status_visible(text_after_name: str) -> bool:
 
 
 def poll_upload_status(page, filename: str) -> str:
-    """Poll the upload page until the file reaches a terminal status.
+    """Poll the upload page until the file's status stabilises on a terminal phrase.
 
-    Returns the final status string, or 'timeout' if we gave up.
+    Savvy processes CSVs asynchronously in multiple phases — an early
+    "Success (Show 0 Flights)" can flip to "Success (Show N Flights)"
+    seconds later as the parser finishes. Returning the first terminal
+    read therefore captures the wrong count.
+
+    Stability gate: require the same terminal status to appear on two
+    consecutive reads before returning. Any transient state (Processing,
+    Checking Duplicates, the file vanishing from the row) resets the
+    captured status so a later Phase-3 transition can't be confirmed
+    against a stale Phase-2 reading. Same overall poll budget
+    (UPLOAD_TIMEOUT) — just one extra confirmation cycle in the common case.
+
+    Returns the stable status string, or 'timeout' if we gave up.
     """
     max_polls = int(UPLOAD_TIMEOUT / 1000 / POLL_INTERVAL)
+    last_status: str | None = None
 
     for attempt in range(max_polls):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -488,12 +568,17 @@ def poll_upload_status(page, filename: str) -> str:
 
         if after_name is None:
             log.info(f"  Poll {attempt + 1}: '{filename}' not yet visible on page.")
-        elif _is_terminal_status_visible(after_name):
-            status = extract_status(after_name)
-            log.info(f"  Poll {attempt + 1}: Done -> {status}")
-            return status
-        else:
+            last_status = None
+        elif not _is_terminal_status_visible(after_name):
             log.info(f"  Poll {attempt + 1}: Still processing...")
+            last_status = None
+        else:
+            status = extract_status(after_name)
+            if status == last_status:
+                log.info(f"  Poll {attempt + 1}: Stable -> {status}")
+                return status
+            log.info(f"  Poll {attempt + 1}: Read -> {status} (awaiting confirmation)")
+            last_status = status
 
         time.sleep(POLL_INTERVAL)
         page.reload(wait_until="domcontentloaded")
@@ -623,7 +708,10 @@ def verify_pending_on_page(page, filenames: list[str]) -> tuple[list[UploadResul
 def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadResult], list[str]]:
     """Retry pass: poll timed-out files from the current batch.
 
-    Reloads the page and polls each file for up to RETRY_POLLS cycles.
+    Reloads the page and polls each file for up to RETRY_POLLS cycles,
+    applying the same consecutive-match stability gate as the main
+    poller so we don't latch a Phase-2 reading here either.
+
     Returns (resolved_results, still_pending_filenames).
     """
     if not timed_out_filenames:
@@ -637,13 +725,22 @@ def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadRe
     time.sleep(3)
 
     for filename in timed_out_filenames:
-        status = None
+        status: str | None = None
+        last_status: str | None = None
 
         for attempt in range(RETRY_POLLS):
-            status = check_file_status_on_page(page, filename)
-            if status:
+            current = check_file_status_on_page(page, filename)
+            if current is None:
+                log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} still processing...")
+                last_status = None
+            elif current == last_status:
+                status = current
+                log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} stable -> {status}")
                 break
-            log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} still processing...")
+            else:
+                log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} -> {current} (awaiting confirmation)")
+                last_status = current
+
             time.sleep(POLL_INTERVAL)
             page.reload(wait_until="domcontentloaded")
             time.sleep(3)
@@ -1062,12 +1159,29 @@ def run(
                 # Any files still not resolved go to persistent pending list
                 pending_filenames.extend(retry_still_pending)
 
-            # --- Verify uploads landed on Savvy ---
+            # --- Settle, then verify uploads landed on Savvy ---
+            # Savvy parses uploaded CSVs in async phases. Phase 3 — real
+            # flight extraction and re-attribution across sibling files —
+            # can land seconds-to-minutes after the upload page first
+            # reports "Success". Sleep before the GraphQL query so the
+            # authoritative count we read isn't a Phase-2 snapshot.
+            # Skip the wait when no new uploads happened this run (purely
+            # pending-verification path): those files were uploaded on a
+            # previous run and have already settled.
+            if results and cfg.graphql_settle_seconds > 0:
+                log.info(
+                    f"Sleeping {cfg.graphql_settle_seconds}s before GraphQL "
+                    f"flight-count query (lets Savvy finish async parsing)..."
+                )
+                time.sleep(cfg.graphql_settle_seconds)
+
             # Dual-signal verification:
             #   1. GraphQL AircraftEngineDataFiles — Savvy's authoritative
             #      list of files it has (regardless of whether they produced
             #      a Flight). Files reported as "Success (0 flights)" still
-            #      appear here.
+            #      appear here. The joined flights{importFile{name}} gives
+            #      us the AUTHORITATIVE flight count per file, bypassing
+            #      the racy upload-page status string entirely.
             #   2. Upload-page status string — if Savvy explicitly returned
             #      "Success*" or "File Duplicated", we trust that too. This
             #      handles the case where GraphQL is briefly out of sync
@@ -1077,8 +1191,9 @@ def run(
             # have to fail for us to mark it unverified.
             all_to_verify = results + verified_results
             log.info("Querying Savvy GraphQL for authoritative file list...")
-            savvy_files = fetch_savvy_filenames(context.request, cfg.aircraft_id)
-            graphql_ok = savvy_files is not None
+            savvy_counts = fetch_savvy_file_flight_counts(context.request, cfg.aircraft_id)
+            graphql_ok = savvy_counts is not None
+            flights_body = ""
             if not graphql_ok:
                 log.warning("GraphQL verification unavailable; falling back to flights-page text + status check.")
                 page.goto(cfg.flights_url, wait_until="domcontentloaded")
@@ -1086,9 +1201,9 @@ def run(
                 page.screenshot(path=str(DEBUG_DIR / "debug_flights_page.png"))
                 flights_body = page.inner_text("body")
             else:
-                log.info(f"Savvy reports {len(savvy_files)} files for this aircraft.")
+                log.info(f"Savvy reports {len(savvy_counts)} file(s) for this aircraft.")
             for r in all_to_verify:
-                in_savvy = graphql_ok and (r.filename in savvy_files)
+                in_savvy = graphql_ok and (r.filename in savvy_counts)
                 status_ok = status_looks_accepted(r.status)
                 text_ok = (not graphql_ok) and (r.filename in flights_body)
                 if in_savvy or status_ok or text_ok:
@@ -1102,6 +1217,34 @@ def run(
                         f"(status reported by upload page: {r.status!r}). "
                         f"Will keep local copy for retry."
                     )
+
+                # GraphQL count overrides the page-derived flights_accepted.
+                # Why authoritative: the page status is one snapshot taken
+                # mid-parse; the GraphQL join after settle reflects Savvy's
+                # post-Phase-3 attribution, which is what actually populates
+                # the user's flight log. When GraphQL is unavailable we
+                # leave the page count alone — it's the best we have.
+                if in_savvy:
+                    graphql_count = savvy_counts[r.filename]
+                    if r.flights_accepted != graphql_count:
+                        log.info(
+                            f"  flights_accepted override: {r.filename} "
+                            f"page={r.flights_accepted} -> graphql={graphql_count}"
+                        )
+                    r.flights_accepted = graphql_count
+                    if graphql_count == 0 and not _is_terminal_no_flight_status(r.status):
+                        # GraphQL says 0 but the page status doesn't imply
+                        # "no flight expected" — Phase 3 may still be in
+                        # flight. Scope cut: original spec was to defer to
+                        # next run for a re-check; left as a follow-up. For
+                        # now, surface the ambiguity so a long-running
+                        # pattern is visible in the email/log.
+                        log.warning(
+                            f"  {r.filename}: GraphQL reports 0 flights but "
+                            f"status {r.status!r} is not a terminal-no-flight "
+                            f"state. Possible late-parsing race; consider "
+                            f"raising GRAPHQL_SETTLE_SECONDS."
+                        )
 
             page.screenshot(path=str(DEBUG_DIR / "debug_final.png"))
 
