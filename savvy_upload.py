@@ -62,6 +62,20 @@ DEBUG_DIR = Path(__file__).parent
 PENDING_FILE = DEBUG_DIR / "pending_uploads.json"
 UNSENT_EMAIL_FILE = DEBUG_DIR / "unsent_email.json"
 
+# Upload-page statuses that mean Savvy is done with the file. The poller
+# stops only when one of these appears in the row text; everything else
+# (e.g. "Processing", "Checking Duplicates") keeps polling. Single source
+# of truth: extract_status only emits these phrases or the "unknown"
+# fallback for genuinely novel server output.
+TERMINAL_STATUS_PHRASES = (
+    "Success",
+    "File Duplicated",
+    "File Too Small",
+    "File Rejected",
+    "Processed",
+    "Error",
+)
+
 # Bump on any breaking change to the summary dict shape (see
 # build_summary_dict). External consumers of the JSONL sidecar should
 # check this and refuse unknown majors rather than guessing fields.
@@ -445,8 +459,21 @@ def upload_single_file(page, csv_path: str) -> None:
         fc_info.value.set_files(csv_path)
 
 
+def _is_terminal_status_visible(text_after_name: str) -> bool:
+    """True if the row text contains a terminal status phrase from
+    TERMINAL_STATUS_PHRASES — the cue for the poller to stop.
+
+    Transient statuses like "Processing" and "Checking Duplicates"
+    don't match, so the poller keeps polling. This keeps a single
+    source of truth: anything not listed here is treated as transient,
+    so a new server-side transient state can't accidentally leak out
+    as a final status.
+    """
+    return any(phrase in text_after_name for phrase in TERMINAL_STATUS_PHRASES)
+
+
 def poll_upload_status(page, filename: str) -> str:
-    """Poll the upload page until the file's status is no longer 'Processing...'.
+    """Poll the upload page until the file reaches a terminal status.
 
     Returns the final status string, or 'timeout' if we gave up.
     """
@@ -461,12 +488,12 @@ def poll_upload_status(page, filename: str) -> str:
 
         if after_name is None:
             log.info(f"  Poll {attempt + 1}: '{filename}' not yet visible on page.")
-        elif "Processing" in after_name:
-            log.info(f"  Poll {attempt + 1}: Still processing...")
-        else:
+        elif _is_terminal_status_visible(after_name):
             status = extract_status(after_name)
             log.info(f"  Poll {attempt + 1}: Done -> {status}")
             return status
+        else:
+            log.info(f"  Poll {attempt + 1}: Still processing...")
 
         time.sleep(POLL_INTERVAL)
         page.reload(wait_until="domcontentloaded")
@@ -486,29 +513,19 @@ def extract_status(text_after_name: str) -> str:
     # "Success (Show N Flights)" - capture the full phrase
     m = re.search(r"Success\s*\(Show\s+(\d+)\s+Flights?\)", text_after_name)
     if m:
-        return f"Success ({m.group(1)} flights)"
+        n = int(m.group(1))
+        unit = "flight" if n == 1 else "flights"
+        return f"Success ({n} {unit})"
 
-    # Known status phrases
-    known = [
-        "File Duplicated",
-        "File Too Small",
-        "File Rejected",
-        "Processed",
-        "Success",
-        "Error",
-    ]
-    for phrase in known:
+    for phrase in TERMINAL_STATUS_PHRASES:
         if phrase in text_after_name:
             return phrase
 
-    # Fallback: strip dates and dots, take first meaningful text
-    cleaned = re.sub(r"\d{4}-\d{2}-\d{2}", "", text_after_name)
-    cleaned = re.sub(r"[●•·✓]", "", cleaned).strip()
-    first_line = cleaned.split("\n")[0].strip()[:40]
-    # Refuse to return obvious filename fragments as a status
-    if first_line.startswith(("_", ".")) or first_line.endswith(".csv"):
-        return "unknown"
-    return first_line if first_line else "completed"
+    # With the terminal-phrase gate in the poller, this should only fire
+    # for genuinely novel server output. Surface it as "unknown" so the
+    # email flags it for investigation rather than smuggling a transient
+    # status through as a final one.
+    return "unknown"
 
 
 def scrape_rejected_flights(page) -> list[RejectedFlight]:
@@ -570,7 +587,7 @@ def check_file_status_on_page(page, filename: str) -> str | None:
     """
     body_text = page.inner_text("body")
     after_name = _text_after_filename(body_text, filename)
-    if after_name is None or "Processing" in after_name:
+    if after_name is None or not _is_terminal_status_visible(after_name):
         return None
     return extract_status(after_name)
 

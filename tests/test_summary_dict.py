@@ -19,8 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from savvy_upload import (  # noqa: E402
     RejectedFlight,
     UploadResult,
+    _is_terminal_status_visible,
     build_summary_dict,
     compose_email_from_summary,
+    extract_status,
 )
 
 FIXED_TIME = datetime(2026, 5, 21, 14, 32, 14, tzinfo=timezone(timedelta(hours=-6)))
@@ -163,11 +165,129 @@ def test_email_body_pins_to_fixture() -> None:
     )
 
 
+def test_extract_status_success_singular() -> None:
+    _assert_eq(
+        "test_extract_status_success_singular",
+        extract_status("✓  Success (Show 1 Flights)"),
+        "Success (1 flight)",
+    )
+
+
+def test_extract_status_success_plural() -> None:
+    _assert_eq(
+        "test_extract_status_success_plural",
+        extract_status("✓  Success (Show 2 Flights)"),
+        "Success (2 flights)",
+    )
+
+
+def test_extract_status_success_zero_is_plural() -> None:
+    # 0 takes the plural form in English ("0 flights", not "0 flight").
+    _assert_eq(
+        "test_extract_status_success_zero_is_plural",
+        extract_status("✓  Success (Show 0 Flights)"),
+        "Success (0 flights)",
+    )
+
+
+def test_is_terminal_status_visible_checking_duplicates_is_transient() -> None:
+    # "Checking Duplicates" is a transient state Savvy shows while
+    # parsing; the poller must keep polling, not stop and return it.
+    _assert_eq(
+        "test_is_terminal_status_visible_checking_duplicates_is_transient",
+        _is_terminal_status_visible("● ● ● ●   Checking Duplicates"),
+        False,
+    )
+
+
+def test_is_terminal_status_visible_processing_is_transient() -> None:
+    _assert_eq(
+        "test_is_terminal_status_visible_processing_is_transient",
+        _is_terminal_status_visible("● ● ● ●   Processing..."),
+        False,
+    )
+
+
+def test_is_terminal_status_visible_success_is_terminal() -> None:
+    _assert_eq(
+        "test_is_terminal_status_visible_success_is_terminal",
+        _is_terminal_status_visible("✓  Success (Show 1 Flights)"),
+        True,
+    )
+
+
+def test_is_terminal_status_visible_file_duplicated_is_terminal() -> None:
+    _assert_eq(
+        "test_is_terminal_status_visible_file_duplicated_is_terminal",
+        _is_terminal_status_visible("● ● ● ●   File Duplicated  Show Duplicate"),
+        True,
+    )
+
+
+class _StubPage:
+    """Minimal stand-in for the Playwright page passed to poll_upload_status.
+
+    Returns inner_text values from a queued sequence so the test can
+    simulate "Checking Duplicates ... Checking Duplicates ... Success".
+    """
+
+    def __init__(self, inner_texts: list[str]) -> None:
+        self._inner_texts = list(inner_texts)
+        self.reload_calls = 0
+
+    def evaluate(self, _script: str) -> None:
+        return None
+
+    def inner_text(self, _selector: str) -> str:
+        if not self._inner_texts:
+            raise AssertionError("StubPage ran out of inner_text values — poller polled more times than the test scripted")
+        return self._inner_texts.pop(0)
+
+    def reload(self, **_kwargs) -> None:
+        self.reload_calls += 1
+
+
+def test_poll_does_not_leak_checking_duplicates_as_final_status() -> None:
+    """With 'Checking Duplicates' on the first poll and 'Success (Show
+    1 Flights)' on the second, the poller must wait for the terminal
+    state — not return 'Checking Duplicates' as the final status."""
+    import savvy_upload  # noqa: PLC0415 — local import to monkey-patch
+
+    filename = "log_20200101_120000_KAAA.csv"
+    page = _StubPage(inner_texts=[
+        f"{filename}\n● ● ● ●   Checking Duplicates",
+        f"{filename}\n✓  Success (Show 1 Flights)",
+    ])
+
+    # Strip the time.sleep / POLL_INTERVAL waits and the per-call 3s reload
+    # delay so the test runs in milliseconds, not minutes.
+    real_sleep = savvy_upload.time.sleep
+    savvy_upload.time.sleep = lambda _seconds: None
+    try:
+        status = savvy_upload.poll_upload_status(page, filename)
+    finally:
+        savvy_upload.time.sleep = real_sleep
+
+    _assert_eq(
+        "test_poll_does_not_leak_checking_duplicates_as_final_status",
+        status,
+        "Success (1 flight)",
+    )
+
+
 def main() -> None:
     test_success_only()
     test_mixed_success_and_duplicate()
     test_success_with_rejected_flights()
     test_email_body_pins_to_fixture()
+    test_extract_status_success_singular()
+    test_extract_status_success_plural()
+    test_extract_status_success_zero_is_plural()
+    test_is_terminal_status_visible_checking_duplicates_is_transient()
+    test_is_terminal_status_visible_processing_is_transient()
+    test_is_terminal_status_visible_success_is_terminal()
+    test_is_terminal_status_visible_file_duplicated_is_terminal()
+    test_poll_does_not_leak_checking_duplicates_as_final_status()
     print("\nAll tests passed.")
 
 
