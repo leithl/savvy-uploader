@@ -100,7 +100,7 @@ This repo is public on GitHub. PRs, commit messages, code comments, log strings,
 - Private helpers prefixed with `_` (e.g., `_read_env`, `_try_msmtp`)
 - Constants in UPPER_CASE at module level
 - Shell scripts use `set -euo pipefail`
-- No test suite — tested manually with `--headed` flag and debug screenshots
+- Tests in `tests/` are stdlib-only (no pytest): run `python3 tests/test_*.py` and `bash tests/test_*.sh`. They cover pure logic and helpers via stubbed Playwright objects; full browser upload flows are still verified manually with `--headed` and debug screenshots
 
 ## External service: SavvyAviation.com
 
