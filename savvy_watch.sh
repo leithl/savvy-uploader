@@ -33,6 +33,13 @@
 #   sudo systemctl enable savvy-upload
 #   sudo systemctl start savvy-upload
 #   journalctl -u savvy-upload -f    # watch logs
+#
+# Note: Restart=on-failure restarts the watcher if it *exits* non-zero, but
+# a crashing upload does NOT exit the watcher — inotifywait stays alive, so
+# systemd sees a healthy process and never restarts. The guard around the
+# upload call (below) is what actually keeps a failed upload from wedging
+# the loop; the systemd Restart is only a backstop for the watcher itself
+# dying (e.g. inotifywait or the network-online dependency).
 
 set -euo pipefail
 
@@ -66,5 +73,16 @@ while read -r dir event file; do
     done
 
     echo "$(date): Running upload..."
-    "$SCRIPT_DIR/savvy_cron.sh"
+    # Guard the upload: a non-zero exit must NOT kill this consumer loop.
+    # Under `set -e`, an unguarded failure here terminates the `while read`
+    # subshell while inotifywait keeps running with nothing draining its
+    # output — the service still shows "active (running)" but silently
+    # ignores every later file until it is manually restarted. Capture the
+    # status, log it, and keep waiting for the next event. (rc is captured
+    # before any other command so $(date) in the message can't clobber $?.)
+    rc=0
+    "$SCRIPT_DIR/savvy_cron.sh" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "$(date): upload failed (exit $rc) — will retry on next event" >&2
+    fi
 done
