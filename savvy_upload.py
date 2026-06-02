@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1009,6 +1010,32 @@ def retry_unsent_emails() -> None:
         log.info("All previously-unsent emails sent successfully.")
 
 
+def compose_failure_email(error: Exception, tb: str) -> tuple[str, str]:
+    """Subject + body for a fatal-run-failure notification.
+
+    Called from run()'s fatal handler. A crash skips the normal summary
+    output entirely (whether that's an email or a JSON sidecar), so this is
+    the only proactive signal an operator gets. The subject carries a
+    one-line error summary; the full traceback goes in the body. Delivery,
+    retries and the on-disk queue are all handled by send_email.
+    """
+    msg = str(error).strip()
+    # The subject takes only the first line — Playwright errors, for one,
+    # append a multi-line "Call log:" that would bloat it.
+    first_line = msg.splitlines()[0] if msg else error.__class__.__name__
+    subject = f"Savvy upload FAILED: {first_line}"
+    if len(subject) > 140:
+        subject = subject[:137] + "..."
+    body = (
+        "A Savvy upload run crashed before completing.\n\n"
+        f"Error: {error.__class__.__name__}: {msg or '(no message)'}\n\n"
+        f"Traceback:\n{tb}\n"
+        "The file watcher keeps running and will retry on the next new file; "
+        "any un-watermarked files are re-attempted automatically on the next run.\n"
+    )
+    return subject, body
+
+
 def send_email(subject: str, body: str, recipient: str, max_retries: int = 3) -> None:
     """Send via msmtp if available, otherwise print to terminal.
 
@@ -1310,6 +1337,14 @@ def run(
                 page.screenshot(path=str(DEBUG_DIR / "debug_error.png"))
             except Exception:
                 pass
+            # A crash skips the normal summary output below, so without this a
+            # fatal run is silent outside the logs. Send a proactive alert —
+            # best-effort: an email problem must not mask the original error.
+            try:
+                subject, body = compose_failure_email(e, traceback.format_exc())
+                send_email(subject, body, cfg.email)
+            except Exception as mail_err:
+                log.error(f"Could not send failure email: {mail_err}")
             raise
         finally:
             browser.close()
