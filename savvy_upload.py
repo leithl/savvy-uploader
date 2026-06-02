@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,13 @@ LOGIN_TIMEOUT = 30_000
 
 POLL_INTERVAL = 10  # seconds between status checks
 RETRY_POLLS = 12    # extra polls per timed-out file during the retry pass
+
+# Retries for an upload-page navigation aborted by the site's own in-flight
+# redirect (see _goto_upload_page). The interrupting navigation targets the
+# same URL, so a small bounded retry resolves it; real navigation failures
+# carry a different error message and are never retried.
+NAV_REDIRECT_RETRIES = 3
+
 DEBUG_DIR = Path(__file__).parent
 PENDING_FILE = DEBUG_DIR / "pending_uploads.json"
 UNSENT_EMAIL_FILE = DEBUG_DIR / "unsent_email.json"
@@ -488,6 +496,41 @@ def do_login(page, email: str, password: str) -> None:
     time.sleep(3)
     page.screenshot(path=str(DEBUG_DIR / "debug_after_login.png"))
     log.info("Login submitted.")
+
+
+def _goto_upload_page(page, upload_url: str) -> None:
+    """Navigate to the upload page, tolerating the post-login redirect race.
+
+    After a successful login the site fires its own redirect back to the
+    originally-requested upload URL. An explicit ``page.goto()`` issued while
+    that redirect is still in flight aborts with "interrupted by another
+    navigation" — both navigations target the same URL, so it's a benign
+    timing race rather than a real failure. Treat only that specific error as
+    retryable: let the competing navigation settle, re-check the URL, and
+    retry up to NAV_REDIRECT_RETRIES times. Every other navigation error
+    (timeouts, DNS, connection refused, ...) propagates immediately, so real
+    failures are never masked.
+    """
+    for attempt in range(1, NAV_REDIRECT_RETRIES + 1):
+        try:
+            page.goto(upload_url, wait_until="domcontentloaded")
+            return
+        except Exception as e:
+            interrupted = "interrupted by another navigation" in str(e)
+            if not (interrupted and attempt < NAV_REDIRECT_RETRIES):
+                raise
+            log.warning(
+                f"Upload-page navigation interrupted by an in-flight redirect "
+                f"(attempt {attempt}/{NAV_REDIRECT_RETRIES}); settling and retrying."
+            )
+            # Let the competing navigation finish. If it lands us on the
+            # upload page, the redirect did our job for us and we're done.
+            try:
+                page.wait_for_url(lambda u: upload_url in u, timeout=NAV_TIMEOUT)
+            except Exception:
+                pass
+            if upload_url in page.url:
+                return
 
 
 def upload_single_file(page, csv_path: str) -> None:
@@ -967,6 +1010,32 @@ def retry_unsent_emails() -> None:
         log.info("All previously-unsent emails sent successfully.")
 
 
+def compose_failure_email(error: Exception, tb: str) -> tuple[str, str]:
+    """Subject + body for a fatal-run-failure notification.
+
+    Called from run()'s fatal handler. A crash skips the normal summary
+    output entirely (whether that's an email or a JSON sidecar), so this is
+    the only proactive signal an operator gets. The subject carries a
+    one-line error summary; the full traceback goes in the body. Delivery,
+    retries and the on-disk queue are all handled by send_email.
+    """
+    msg = str(error).strip()
+    # The subject takes only the first line — Playwright errors, for one,
+    # append a multi-line "Call log:" that would bloat it.
+    first_line = msg.splitlines()[0] if msg else error.__class__.__name__
+    subject = f"Savvy upload FAILED: {first_line}"
+    if len(subject) > 140:
+        subject = subject[:137] + "..."
+    body = (
+        "A Savvy upload run crashed before completing.\n\n"
+        f"Error: {error.__class__.__name__}: {msg or '(no message)'}\n\n"
+        f"Traceback:\n{tb}\n"
+        "The file watcher keeps running and will retry on the next new file; "
+        "any un-watermarked files are re-attempted automatically on the next run.\n"
+    )
+    return subject, body
+
+
 def send_email(subject: str, body: str, recipient: str, max_retries: int = 3) -> None:
     """Send via msmtp if available, otherwise print to terminal.
 
@@ -1057,9 +1126,23 @@ def run(
             time.sleep(2)
             do_login(page, cfg.email, cfg.password)
 
-            # Make sure we're on the upload page after login
+            # After login the site redirects back to the originally-requested
+            # upload URL. Let that in-flight redirect settle before deciding
+            # whether we still need to navigate — firing our own goto() into
+            # the redirect aborts with "interrupted by another navigation"
+            # (an intermittent production crash). Best-effort: if it doesn't
+            # land us there, the explicit nav below still gets us on the page.
+            try:
+                page.wait_for_url(
+                    lambda u: cfg.upload_url in u, timeout=LOGIN_TIMEOUT
+                )
+            except Exception:
+                pass
+
+            # Make sure we're on the upload page after login. _goto_upload_page
+            # tolerates a late redirect that races our goto().
             if cfg.upload_url not in page.url:
-                page.goto(cfg.upload_url, wait_until="domcontentloaded")
+                _goto_upload_page(page, cfg.upload_url)
                 time.sleep(2)
 
             # --- Verify pending files from previous runs ---
@@ -1134,7 +1217,7 @@ def run(
                 # Reload upload page for next file
                 if i < len(csv_files):
                     try:
-                        page.goto(cfg.upload_url, wait_until="domcontentloaded")
+                        _goto_upload_page(page, cfg.upload_url)
                         time.sleep(2)
                     except Exception as e:
                         log.error(f"Failed to reload upload page: {e}")
@@ -1144,7 +1227,7 @@ def run(
             # --- Retry pass for timed-out files from this batch ---
             timed_out = [r.filename for r in results if r.status == "timeout"]
             if timed_out:
-                page.goto(cfg.upload_url, wait_until="domcontentloaded")
+                _goto_upload_page(page, cfg.upload_url)
                 time.sleep(2)
                 retry_resolved, retry_still_pending = retry_timed_out(page, timed_out)
 
@@ -1254,6 +1337,14 @@ def run(
                 page.screenshot(path=str(DEBUG_DIR / "debug_error.png"))
             except Exception:
                 pass
+            # A crash skips the normal summary output below, so without this a
+            # fatal run is silent outside the logs. Send a proactive alert —
+            # best-effort: an email problem must not mask the original error.
+            try:
+                subject, body = compose_failure_email(e, traceback.format_exc())
+                send_email(subject, body, cfg.email)
+            except Exception as mail_err:
+                log.error(f"Could not send failure email: {mail_err}")
             raise
         finally:
             browser.close()

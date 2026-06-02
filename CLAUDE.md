@@ -81,6 +81,8 @@ Recommended production deployment is as a systemd service running `savvy_watch.s
 
 **Email retry with backoff:** 3 attempts (0s, 10s, 20s delays), then persisted to `unsent_email.json` for retry next run.
 
+**Failure alerts:** a fatal crash aborts before the normal summary runs, so `run()`'s fatal handler sends a `Savvy upload FAILED: …` email (`compose_failure_email`). It fires independently of `SUMMARY_DIR` — so a crash is never silent, even in JSON-sidecar mode — and is best-effort: a send failure is logged, never masking the original error.
+
 **Network error handling:** If page reload fails between uploads, batch stops early. Un-watermarked files retry automatically on the next run.
 
 **Rejected flight attribution:** Scrapes the "Rejected" panel after each upload. Tracks a baseline of pre-existing rejected flights so only *new* rejections are attributed to each file.
@@ -100,7 +102,7 @@ This repo is public on GitHub. PRs, commit messages, code comments, log strings,
 - Private helpers prefixed with `_` (e.g., `_read_env`, `_try_msmtp`)
 - Constants in UPPER_CASE at module level
 - Shell scripts use `set -euo pipefail`
-- No test suite — tested manually with `--headed` flag and debug screenshots
+- Tests in `tests/` are stdlib-only (no pytest): run `python3 tests/test_*.py` and `bash tests/test_*.sh`. They cover pure logic and helpers via stubbed Playwright objects; full browser upload flows are still verified manually with `--headed` and debug screenshots
 
 ## External service: SavvyAviation.com
 
