@@ -84,6 +84,14 @@ TERMINAL_STATUS_PHRASES = (
     "Error",
 )
 
+# Status recorded when the left "Recent Uploads" widget never reaches a
+# terminal phrase but Savvy has clearly finished the file by listing its
+# flight(s) as rejected in the right "Recent Flights" panel (e.g. a flight
+# too short to keep). These files ARE on Savvy with 0 accepted flights, so
+# this is a real terminal outcome — not the opaque "timeout" we reserve for
+# genuine no-signal-anywhere hangs. See poll_upload_status / _new_rejected_in_text.
+REJECTED_STATUS = "Rejected"
+
 # Bump on any breaking change to the summary dict shape (see
 # build_summary_dict). External consumers of the JSONL sidecar should
 # check this and refuse unknown majors rather than guessing fields.
@@ -220,6 +228,7 @@ TERMINAL_NO_FLIGHT_PREFIXES = (
     "File Duplicated",
     "File Too Small",
     "File Rejected",
+    "Rejected",  # REJECTED_STATUS: panel-detected rejection legitimately has 0 flights
     "Error",
     "error",  # the "error: <exception>" path produced by upload exceptions
 )
@@ -582,7 +591,9 @@ def _is_terminal_status_visible(text_after_name: str) -> bool:
     return any(phrase in text_after_name for phrase in TERMINAL_STATUS_PHRASES)
 
 
-def poll_upload_status(page, filename: str) -> str:
+def poll_upload_status(
+    page, filename: str, seen_rejected: set[RejectedFlight] | None = None
+) -> str:
     """Poll the upload page until the file's status stabilises on a terminal phrase.
 
     Savvy processes CSVs asynchronously in multiple phases — an early
@@ -597,7 +608,20 @@ def poll_upload_status(page, filename: str) -> str:
     against a stale Phase-2 reading. Same overall poll budget
     (UPLOAD_TIMEOUT) — just one extra confirmation cycle in the common case.
 
-    Returns the stable status string, or 'timeout' if we gave up.
+    Second terminal signal (the Rejected panel): for a flight Savvy rejects
+    as too short, the left "Recent Uploads" status can get stuck mid-phase
+    (e.g. "Uploading… (0%)") and never reach a terminal phrase — so the
+    stability gate alone would loop to 'timeout'. When the caller passes a
+    ``seen_rejected`` baseline, each cycle also checks the right "Recent
+    Flights" Rejected panel; a NEW rejected row (one not in the baseline)
+    means Savvy finished and rejected the flight, and we return
+    REJECTED_STATUS. Only consulted when the left widget is NOT showing a
+    terminal phrase, so a normal "Success (N flights)" file (which may also
+    have a rejected leg) still resolves via the stability gate. Callers
+    that don't pass a baseline (e.g. unit tests of the gate) keep the
+    original left-widget-only behaviour.
+
+    Returns the stable status string, REJECTED_STATUS, or 'timeout'.
     """
     max_polls = int(UPLOAD_TIMEOUT / 1000 / POLL_INTERVAL)
     last_status: str | None = None
@@ -608,11 +632,12 @@ def poll_upload_status(page, filename: str) -> str:
 
         body_text = page.inner_text("body")
         after_name = _text_after_filename(body_text, filename)
+        left_terminal = after_name is not None and _is_terminal_status_visible(after_name)
 
         if after_name is None:
             log.info(f"  Poll {attempt + 1}: '{filename}' not yet visible on page.")
             last_status = None
-        elif not _is_terminal_status_visible(after_name):
+        elif not left_terminal:
             log.info(f"  Poll {attempt + 1}: Still processing...")
             last_status = None
         else:
@@ -622,6 +647,17 @@ def poll_upload_status(page, filename: str) -> str:
                 return status
             log.info(f"  Poll {attempt + 1}: Read -> {status} (awaiting confirmation)")
             last_status = status
+
+        # Panel-based terminal signal — only when the left widget hasn't given
+        # a terminal phrase this cycle, so it can't pre-empt a Success.
+        if seen_rejected is not None and not left_terminal:
+            new_rejected = _new_rejected_in_text(body_text, seen_rejected)
+            if new_rejected:
+                log.info(
+                    f"  Poll {attempt + 1}: Savvy rejected {len(new_rejected)} "
+                    f"flight(s) for '{filename}' (terminal via Rejected panel)."
+                )
+                return REJECTED_STATUS
 
         time.sleep(POLL_INTERVAL)
         page.reload(wait_until="domcontentloaded")
@@ -656,15 +692,15 @@ def extract_status(text_after_name: str) -> str:
     return "unknown"
 
 
-def scrape_rejected_flights(page) -> list[RejectedFlight]:
-    """Scrape the 'Rejected' table from the right-side Recent Flights panel.
+def parse_rejected_flights(body_text: str) -> list[RejectedFlight]:
+    """Parse the 'Rejected' table out of the page's body text.
 
-    The panel has two sections: 'Accepted' and 'Rejected'.
-    The Rejected table has columns: Date, Departure Airport,
-    Destination Airport, Duration, Action.
+    The right-side Recent Flights panel has two sections, 'Accepted' and
+    'Rejected'. The Rejected table has columns: Date, Departure Airport,
+    Destination Airport, Duration, Action. Pure function (no page) so the
+    scraping can be unit-tested against fixture text.
     """
-    rejected = []
-    body_text = page.inner_text("body")
+    rejected: list[RejectedFlight] = []
 
     # Find the Rejected section
     if "Rejected" not in body_text:
@@ -707,21 +743,55 @@ def scrape_rejected_flights(page) -> list[RejectedFlight]:
     return rejected
 
 
-def check_file_status_on_page(page, filename: str) -> str | None:
-    """Check if a file's status is visible on the current page.
+def scrape_rejected_flights(page) -> list[RejectedFlight]:
+    """Scrape the 'Rejected' table from the right-side Recent Flights panel."""
+    return parse_rejected_flights(page.inner_text("body"))
 
-    Returns the status string if the file is done processing,
-    None if not found or still processing.
+
+def _attribute_new_rejected(
+    page, seen_rejected: set[RejectedFlight]
+) -> tuple[list[RejectedFlight], set[RejectedFlight]]:
+    """Scrape the Rejected panel and split out the rows not already in the
+    baseline. Returns (newly-appeared rejected flights sorted by date, full
+    current set). The full set becomes the next file's baseline so each file
+    is attributed only its own new rejections.
     """
-    body_text = page.inner_text("body")
+    all_rejected = set(scrape_rejected_flights(page))
+    new = sorted(all_rejected - seen_rejected, key=lambda rf: rf.date)
+    return new, all_rejected
+
+
+def _new_rejected_in_text(
+    body_text: str, seen_rejected: set[RejectedFlight]
+) -> list[RejectedFlight]:
+    """Rejected rows present in body_text but not in the baseline, sorted by
+    date. Used as a terminal signal: a new rejected row attributable to the
+    file being polled means Savvy finished and rejected it, even when the
+    left 'Recent Uploads' widget is stuck mid-phase.
+    """
+    new = set(parse_rejected_flights(body_text)) - seen_rejected
+    return sorted(new, key=lambda rf: rf.date)
+
+
+def _terminal_status_in_text(body_text: str, filename: str) -> str | None:
+    """Terminal status for a file from page body text, or None if the file
+    isn't visible yet or is still processing. Pure (no page) for testing."""
     after_name = _text_after_filename(body_text, filename)
     if after_name is None or not _is_terminal_status_visible(after_name):
         return None
     return extract_status(after_name)
 
 
-def verify_pending_on_page(page, filenames: list[str]) -> tuple[list[UploadResult], list[str]]:
+def verify_pending_on_page(
+    page, filenames: list[str], seen_rejected: set[RejectedFlight] | None = None
+) -> tuple[list[UploadResult], list[str]]:
     """Check the upload page for status of previously timed-out files.
+
+    Reads the body once per file and consults two terminal signals: the
+    left "Recent Uploads" status, and — when ``seen_rejected`` is supplied —
+    a NEW row in the right "Recent Flights" Rejected panel (a rejection that
+    surfaced after the original run timed out). Mutates ``seen_rejected`` so
+    a row attributed to one file isn't re-attributed to the next.
 
     Returns (resolved_results, still_pending_filenames).
     """
@@ -732,9 +802,21 @@ def verify_pending_on_page(page, filenames: list[str]) -> tuple[list[UploadResul
     time.sleep(3)
 
     for filename in filenames:
-        status = check_file_status_on_page(page, filename)
+        body_text = page.inner_text("body")
+        status = _terminal_status_in_text(body_text, filename)
+        rejected_for_file: list[RejectedFlight] = []
+        if status is None and seen_rejected is not None:
+            rejected_for_file = _new_rejected_in_text(body_text, seen_rejected)
+            if rejected_for_file:
+                seen_rejected |= set(rejected_for_file)
+                status = REJECTED_STATUS
+
         if status:
-            result = UploadResult(filename=filename, status=f"{status} (verified after retry)")
+            result = UploadResult(
+                filename=filename,
+                status=f"{status} (verified after retry)",
+                rejected_flights=rejected_for_file,
+            )
             if "Success" in status:
                 flights_match = re.search(r"(\d+) flights?", status)
                 if flights_match:
@@ -748,12 +830,18 @@ def verify_pending_on_page(page, filenames: list[str]) -> tuple[list[UploadResul
     return resolved, still_pending
 
 
-def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadResult], list[str]]:
+def retry_timed_out(
+    page, timed_out_filenames: list[str], seen_rejected: set[RejectedFlight] | None = None
+) -> tuple[list[UploadResult], list[str]]:
     """Retry pass: poll timed-out files from the current batch.
 
     Reloads the page and polls each file for up to RETRY_POLLS cycles,
     applying the same consecutive-match stability gate as the main
-    poller so we don't latch a Phase-2 reading here either.
+    poller so we don't latch a Phase-2 reading here either. When
+    ``seen_rejected`` is supplied, each cycle also treats a NEW row in the
+    Rejected panel as a terminal outcome (REJECTED_STATUS) — the same
+    late-rejection signal the main poller uses, for a file whose rejection
+    only surfaced after the first poll window. Mutates ``seen_rejected``.
 
     Returns (resolved_results, still_pending_filenames).
     """
@@ -770,9 +858,11 @@ def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadRe
     for filename in timed_out_filenames:
         status: str | None = None
         last_status: str | None = None
+        rejected_for_file: list[RejectedFlight] = []
 
         for attempt in range(RETRY_POLLS):
-            current = check_file_status_on_page(page, filename)
+            body_text = page.inner_text("body")
+            current = _terminal_status_in_text(body_text, filename)
             if current is None:
                 log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} still processing...")
                 last_status = None
@@ -784,12 +874,29 @@ def retry_timed_out(page, timed_out_filenames: list[str]) -> tuple[list[UploadRe
                 log.info(f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} -> {current} (awaiting confirmation)")
                 last_status = current
 
+            # Panel-based terminal signal — only when the left widget isn't
+            # already reporting a terminal status this cycle.
+            if current is None and seen_rejected is not None:
+                rejected_for_file = _new_rejected_in_text(body_text, seen_rejected)
+                if rejected_for_file:
+                    seen_rejected |= set(rejected_for_file)
+                    status = REJECTED_STATUS
+                    log.info(
+                        f"  Retry poll {attempt + 1}/{RETRY_POLLS}: {filename} "
+                        f"rejected {len(rejected_for_file)} flight(s) (Rejected panel)."
+                    )
+                    break
+
             time.sleep(POLL_INTERVAL)
             page.reload(wait_until="domcontentloaded")
             time.sleep(3)
 
         if status:
-            result = UploadResult(filename=filename, status=f"{status} (after retry)")
+            result = UploadResult(
+                filename=filename,
+                status=f"{status} (after retry)",
+                rejected_flights=rejected_for_file,
+            )
             if "Success" in status:
                 flights_match = re.search(r"(\d+) flights?", status)
                 if flights_match:
@@ -1145,19 +1252,24 @@ def run(
                 _goto_upload_page(page, cfg.upload_url)
                 time.sleep(2)
 
-            # --- Verify pending files from previous runs ---
-            if pending_filenames:
-                log.info(f"Verifying {len(pending_filenames)} file(s) from previous run(s)...")
-                verified, still_pending = verify_pending_on_page(page, pending_filenames)
-                verified_results.extend(verified)
-                pending_filenames = still_pending
-
             # --- Snapshot baseline rejected flights already on the page ---
+            # Taken BEFORE verifying pending files so a late-surfacing
+            # rejection for one of them can be attributed (diffed against
+            # this baseline) rather than swallowed into it.
             page.evaluate("window.scrollTo(0, 0)")
             time.sleep(1)
             seen_rejected: set[RejectedFlight] = set(scrape_rejected_flights(page))
             if seen_rejected:
                 log.info(f"Baseline: {len(seen_rejected)} pre-existing rejected flight(s) on page.")
+
+            # --- Verify pending files from previous runs ---
+            if pending_filenames:
+                log.info(f"Verifying {len(pending_filenames)} file(s) from previous run(s)...")
+                verified, still_pending = verify_pending_on_page(
+                    page, pending_filenames, seen_rejected
+                )
+                verified_results.extend(verified)
+                pending_filenames = still_pending
 
             # --- Upload each file ---
             for i, csv_path in enumerate(csv_files, 1):
@@ -1170,13 +1282,17 @@ def run(
                     log.info("File selected, waiting for upload to process...")
                     time.sleep(5)
 
-                    status = poll_upload_status(page, filename)
+                    status = poll_upload_status(page, filename, seen_rejected)
                     result.status = status
                     log.info(f"[{i}/{len(csv_files)}] {filename} -> {status}")
 
-                    # If upload succeeded, check the right-side panel for
-                    # accepted/rejected flights
-                    if "Success" in status:
+                    # Both a successful upload and a panel-detected rejection
+                    # need the right-side Recent Flights panel scraped to
+                    # attribute this file's NEW rejected flights. (A "Success"
+                    # file can still have a rejected leg; a REJECTED_STATUS
+                    # file is one whose left widget never went terminal but
+                    # whose flight Savvy rejected — e.g. too short.)
+                    if "Success" in status or status == REJECTED_STATUS:
                         # Scroll back up to see the Recent Flights panel
                         page.evaluate("window.scrollTo(0, 0)")
                         time.sleep(2)
@@ -1186,21 +1302,18 @@ def run(
                         if flights_match:
                             result.flights_accepted = int(flights_match.group(1))
 
-                        # Check for rejected flights - only attribute NEW ones
-                        all_rejected = set(scrape_rejected_flights(page))
-                        new_rejected = all_rejected - seen_rejected
+                        # Attribute only rejected rows NEW since the last file.
+                        new_rejected, seen_rejected = _attribute_new_rejected(
+                            page, seen_rejected
+                        )
                         if new_rejected:
-                            result.rejected_flights = sorted(
-                                new_rejected, key=lambda rf: rf.date
-                            )
-                            for rf in result.rejected_flights:
+                            result.rejected_flights = new_rejected
+                            for rf in new_rejected:
                                 log.info(
                                     f"    Rejected flight: {rf.date} "
                                     f"{rf.departure} -> {rf.destination} "
                                     f"({rf.duration})"
                                 )
-                        # Update baseline so next file only sees its own
-                        seen_rejected = all_rejected
 
                 except Exception as e:
                     result.status = f"error: {e}"
@@ -1229,7 +1342,9 @@ def run(
             if timed_out:
                 _goto_upload_page(page, cfg.upload_url)
                 time.sleep(2)
-                retry_resolved, retry_still_pending = retry_timed_out(page, timed_out)
+                retry_resolved, retry_still_pending = retry_timed_out(
+                    page, timed_out, seen_rejected
+                )
 
                 # Update original results for resolved files
                 resolved_map = {r.filename: r for r in retry_resolved}
@@ -1238,6 +1353,7 @@ def run(
                         resolved = resolved_map[r.filename]
                         r.status = resolved.status
                         r.flights_accepted = resolved.flights_accepted
+                        r.rejected_flights = resolved.rejected_flights
 
                 # Any files still not resolved go to persistent pending list
                 pending_filenames.extend(retry_still_pending)

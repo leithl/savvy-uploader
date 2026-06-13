@@ -163,7 +163,7 @@ Configure `~/.msmtprc` with your email provider's SMTP settings. See the [msmtp 
 2. Scans `CSV_DIR` for files matching `log_*_*.csv`, skipping any already uploaded (based on `LAST_UPLOADED` watermark)
 3. Launches a headless Chromium browser and logs into SavvyAviation
 4. Uploads each file one at a time, polling for status (Success, Duplicated, Too Small, etc.)
-5. After each successful upload, checks for newly rejected flights
+5. Checks the "Rejected" panel for newly rejected flights — including for a file whose flight Savvy rejects as too short, where the upload-status widget can stall and never report success; that file is recorded as rejected (0 accepted flights) rather than a bare timeout
 6. Navigates to the flights page to verify uploads appeared
 7. Updates the `LAST_UPLOADED` watermark in `.env`
 8. Sends an email summary (or prints to terminal)

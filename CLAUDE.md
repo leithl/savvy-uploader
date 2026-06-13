@@ -85,7 +85,7 @@ Recommended production deployment is as a systemd service running `savvy_watch.s
 
 **Network error handling:** If page reload fails between uploads, batch stops early. Un-watermarked files retry automatically on the next run.
 
-**Rejected flight attribution:** Scrapes the "Rejected" panel after each upload. Tracks a baseline of pre-existing rejected flights so only *new* rejections are attributed to each file.
+**Rejected flight attribution:** Scrapes the "Rejected" panel and attributes only *new* rows (diffed against a baseline of pre-existing rejected flights) to each file. The panel is also a **terminal signal**: when Savvy rejects a flight (e.g. too short) the left "Recent Uploads" status can stick mid-phase and never reach a terminal phrase, so the poller (and the retry / pending-verification passes) treat a new rejected row as terminal and record `status="Rejected"` (`REJECTED_STATUS`) with `flights_accepted=0`. This keeps the bare `"timeout"` status reserved for genuine no-signal-anywhere hangs, so a rejected-too-short file is distinguishable from a processing hang in the summary/JSONL output. The left-widget terminal status still wins when present, so a normal `Success (N flights)` file (even one with a rejected leg) is unaffected.
 
 ## Public repo — keep contributions standalone
 
