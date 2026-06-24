@@ -92,10 +92,33 @@ TERMINAL_STATUS_PHRASES = (
 # genuine no-signal-anywhere hangs. See poll_upload_status / _new_rejected_in_text.
 REJECTED_STATUS = "Rejected"
 
+# Reason attributed to a flight in Savvy's "Rejected" panel. That panel is
+# Savvy's short-flight bucket (the GraphQL `hideShortFlights` category) and
+# carries no per-row reason text — its columns are only Date, Departure,
+# Destination, Duration, Action — so every panel rejection is attributed
+# this one reason. If Savvy ever surfaces an explicit reason string, capture
+# it on RejectedFlight and prefer it over this default.
+DEFAULT_REJECTION_REASON = "too short"
+
+# Per-file outcome categories — the machine-readable classification a summary
+# consumer renders from, so it never has to sniff the raw Savvy status string
+# (the source of the "Success (1 flight)" vs "1 accepted flight" inconsistency
+# we got bitten by). summary_line() is the matching human-readable projection.
+OUTCOME_ACCEPTED = "accepted"     # >=1 accepted flight, none rejected
+OUTCOME_MIXED = "mixed"           # >=1 accepted AND >=1 rejected
+OUTCOME_REJECTED = "rejected"     # 0 accepted, >=1 rejected
+OUTCOME_DUPLICATE = "duplicate"   # Savvy already had this file
+OUTCOME_TOO_SMALL = "too_small"   # the file itself was too small to parse
+OUTCOME_NONE = "none"             # processed, no flight (e.g. ground engine run)
+OUTCOME_TIMEOUT = "timeout"       # no terminal signal anywhere; retry next run
+OUTCOME_ERROR = "error"           # upload raised before Savvy acknowledged it
+OUTCOME_UNKNOWN = "unknown"       # novel / unrecognised Savvy status
+
 # Bump on any breaking change to the summary dict shape (see
 # build_summary_dict). External consumers of the JSONL sidecar should
 # check this and refuse unknown majors rather than guessing fields.
-SUMMARY_SCHEMA_VERSION = 1
+# v2: added per-file `outcome` + `summary`, per-rejection `reason`.
+SUMMARY_SCHEMA_VERSION = 2
 
 # Logging setup
 logging.basicConfig(
@@ -913,6 +936,112 @@ def retry_timed_out(
 # ---------------------------------------------------------------------------
 # Summary (canonical dict + projections: email body, JSON sidecar)
 # ---------------------------------------------------------------------------
+def _compact_duration(duration: str) -> str:
+    """'0h 2m 3s' -> '2m 3s', '0h 0m 9s' -> '9s', '1h 0m 5s' -> '1h 0m 5s'.
+
+    Drops leading zero-valued units so the common short-flight case reads
+    cleanly, then keeps every unit once a non-zero one appears. Returns the
+    input unchanged if it doesn't match Savvy's 'Xh Ym Zs' shape (e.g. '?')."""
+    m = re.match(r"(\d+)h\s+(\d+)m(?:\s+(\d+)s)?", duration.strip())
+    if not m:
+        return duration.strip()
+    units = [
+        (int(m.group(1)), "h"),
+        (int(m.group(2)), "m"),
+        (int(m.group(3) or 0), "s"),
+    ]
+    while len(units) > 1 and units[0][0] == 0:
+        units.pop(0)
+    return " ".join(f"{v}{u}" for v, u in units)
+
+
+def classify_outcome(status: str, flights_accepted: int, n_rejected: int) -> str:
+    """Map a file's (raw status, accepted count, rejected count) to one of the
+    OUTCOME_* categories.
+
+    Keys off the structured counts before the raw status, so a file accepted
+    via the post-settle GraphQL re-count — whose raw status may never have said
+    'Success' — still classifies as accepted. That status-vs-count split is
+    exactly what made two identical outcomes render two different ways."""
+    s = (status or "").strip()
+    if s == "timeout":
+        return OUTCOME_TIMEOUT
+    if s.startswith(("error", "Error")):
+        return OUTCOME_ERROR
+    if flights_accepted > 0 and n_rejected > 0:
+        return OUTCOME_MIXED
+    if flights_accepted > 0:
+        return OUTCOME_ACCEPTED
+    if n_rejected > 0:
+        return OUTCOME_REJECTED
+    if s.startswith("File Duplicated"):
+        return OUTCOME_DUPLICATE
+    if s.startswith("File Too Small"):
+        return OUTCOME_TOO_SMALL
+    if s.startswith(("File Rejected", REJECTED_STATUS)):
+        return OUTCOME_REJECTED
+    if not s or s == "unknown":
+        return OUTCOME_UNKNOWN
+    return OUTCOME_NONE
+
+
+def _flights_accepted_phrase(n: int) -> str:
+    return f"{n} flight accepted" if n == 1 else f"{n} flights accepted"
+
+
+def _rf_duration(rf) -> str:
+    """Duration of a rejected flight, whether it's a RejectedFlight or the
+    dict form from a summary sidecar — so summary_line works on both."""
+    return rf["duration"] if isinstance(rf, dict) else rf.duration
+
+
+def _rejected_phrase(rejected_flights: list, *, standalone: bool) -> str:
+    """Human phrase for a file's rejected flights, e.g.:
+
+        standalone=True  -> 'rejected — too short (2m 3s)'   (rejected-only file)
+        standalone=False -> '1 rejected (too short, 2m 3s)'  (appended to a mix)
+
+    For >1 rejection the per-flight duration is dropped (the detail lines carry
+    it); the reason is uniform so it's stated once."""
+    n = len(rejected_flights)
+    reason = DEFAULT_REJECTION_REASON
+    if n == 1:
+        dur = _compact_duration(_rf_duration(rejected_flights[0]))
+        if standalone:
+            return f"rejected — {reason} ({dur})"
+        return f"1 rejected ({reason}, {dur})"
+    if standalone:
+        return f"rejected — {n} flights ({reason})"
+    return f"{n} rejected ({reason})"
+
+
+def summary_line(status: str, flights_accepted: int, rejected_flights: list) -> str:
+    """One-line human outcome for a file — the consistent per-file phrasing the
+    email and JSONL sidecar render instead of echoing Savvy's raw status. Two
+    files with the same real outcome always produce the same line here."""
+    outcome = classify_outcome(status, flights_accepted, len(rejected_flights))
+    if outcome == OUTCOME_ACCEPTED:
+        return _flights_accepted_phrase(flights_accepted)
+    if outcome == OUTCOME_MIXED:
+        accepted = "1 accepted" if flights_accepted == 1 else f"{flights_accepted} accepted"
+        return f"{accepted}, {_rejected_phrase(rejected_flights, standalone=False)}"
+    if outcome == OUTCOME_REJECTED:
+        if rejected_flights:
+            return _rejected_phrase(rejected_flights, standalone=True)
+        return "rejected by Savvy"
+    if outcome == OUTCOME_DUPLICATE:
+        return "already uploaded (duplicate)"
+    if outcome == OUTCOME_TOO_SMALL:
+        return "file too small — no usable data"
+    if outcome == OUTCOME_TIMEOUT:
+        return "still processing — will re-check next run"
+    if outcome == OUTCOME_ERROR:
+        return "upload error — see log"
+    if outcome == OUTCOME_UNKNOWN:
+        return "unrecognised status — see log"
+    return "no flight recorded"
+
+
 def build_summary_dict(
     results: list[UploadResult],
     n_skipped: int = 0,
@@ -943,6 +1072,12 @@ def build_summary_dict(
             {
                 "filename": r.filename,
                 "status": r.status,
+                "outcome": classify_outcome(
+                    r.status, r.flights_accepted, len(r.rejected_flights)
+                ),
+                "summary": summary_line(
+                    r.status, r.flights_accepted, r.rejected_flights
+                ),
                 "flights_accepted": r.flights_accepted,
                 "on_savvy": r.on_flights_page,
                 "rejected_flights": [
@@ -951,6 +1086,7 @@ def build_summary_dict(
                         "departure": rf.departure,
                         "destination": rf.destination,
                         "duration": rf.duration,
+                        "reason": DEFAULT_REJECTION_REASON,
                     }
                     for rf in r.rejected_flights
                 ],
@@ -968,11 +1104,25 @@ def compose_email_from_summary(summary: dict) -> tuple[str, str]:
     n_still_pending = summary["n_pending"]
 
     now = datetime.fromisoformat(summary["run_at"]).strftime("%Y-%m-%d %H:%M")
-    n_success = sum(1 for f in files if "Success" in f["status"])
-    n_dup = sum(1 for f in files if "Duplicated" in f["status"])
-    n_err = sum(1 for f in files if f["status"].startswith("error"))
-    n_timeout = sum(1 for f in files if f["status"] == "timeout")
-    n_other = len(files) - n_success - n_dup - n_err - n_timeout
+
+    # Count by the machine-readable `outcome`, not by sniffing the raw status
+    # string — so a file accepted via the GraphQL re-count (status not
+    # "Success") still tallies as accepted. Older sidecars without `outcome`
+    # fall back to a re-classification from the fields they do carry.
+    def _outcome(f: dict) -> str:
+        return f.get("outcome") or classify_outcome(
+            f["status"], f["flights_accepted"], len(f["rejected_flights"])
+        )
+
+    n_accepted = sum(1 for f in files if _outcome(f) in (OUTCOME_ACCEPTED, OUTCOME_MIXED))
+    n_rejected_files = sum(1 for f in files if _outcome(f) == OUTCOME_REJECTED)
+    n_dup = sum(1 for f in files if _outcome(f) == OUTCOME_DUPLICATE)
+    n_err = sum(1 for f in files if _outcome(f) == OUTCOME_ERROR)
+    n_timeout = sum(1 for f in files if _outcome(f) == OUTCOME_TIMEOUT)
+    n_other = (
+        len(files) - n_accepted - n_rejected_files - n_dup - n_err - n_timeout
+    )
+    total_flights = sum(f["flights_accepted"] for f in files)
     total_rejected = sum(len(f["rejected_flights"]) for f in files)
 
     subject = f"Savvy Upload Report - {now} ({len(files)} files)"
@@ -981,16 +1131,19 @@ def compose_email_from_summary(summary: dict) -> tuple[str, str]:
         "Savvy Aviation Upload Report",
         f"Run at: {now}",
         f"Files processed: {len(files)}",
-        f"  Successful: {n_success}",
-        f"  Duplicated: {n_dup}",
-        f"  Errors:     {n_err}",
+        f"  Files accepted:   {n_accepted}",
+        f"  Files rejected:   {n_rejected_files}",
+        f"  Files duplicated: {n_dup}",
+        f"  Files errored:    {n_err}",
     ]
+    if total_flights:
+        lines.append(f"  Flights accepted: {total_flights}")
     if total_rejected:
-        lines.append(f"  Flights rejected by Savvy: {total_rejected}")
+        lines.append(f"  Flights rejected: {total_rejected}")
     if n_timeout:
-        lines.append(f"  Timed out:  {n_timeout}")
+        lines.append(f"  Timed out:        {n_timeout}")
     if n_other:
-        lines.append(f"  Other:      {n_other}")
+        lines.append(f"  Other:            {n_other}")
     if n_verified:
         lines.append(f"  Verified from previous run: {n_verified}")
     if n_skipped:
@@ -1019,18 +1172,19 @@ def compose_email_from_summary(summary: dict) -> tuple[str, str]:
         "-" * 70,
     ]
     for f in files:
-        flights_note = " (verified on Savvy)" if f["on_savvy"] else " !! NOT on Savvy"
+        summary_text = f.get("summary") or summary_line(
+            f["status"], f["flights_accepted"], f["rejected_flights"]
+        )
+        savvy_note = "" if f["on_savvy"] else "  !! NOT on Savvy"
         lines.append(f"  {f['filename']}")
-        lines.append(f"    Status: {f['status']}{flights_note}")
+        lines.append(f"    {summary_text}{savvy_note}")
 
-        rejected = f["rejected_flights"]
-        if rejected:
-            lines.append(f"    Rejected flights ({len(rejected)}):")
-            for rf in rejected:
-                lines.append(
-                    f"      {rf['date']}  {rf['departure']} -> {rf['destination']}"
-                    f"  ({rf['duration']})"
-                )
+        for rf in f["rejected_flights"]:
+            reason = rf.get("reason", DEFAULT_REJECTION_REASON)
+            lines.append(
+                f"      {rf['date']}  {rf['departure']} -> {rf['destination']}"
+                f"  ({reason}, {_compact_duration(rf['duration'])})"
+            )
         lines.append("")
 
     if n_err:
