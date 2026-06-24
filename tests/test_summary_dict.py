@@ -19,10 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from savvy_upload import (  # noqa: E402
     RejectedFlight,
     UploadResult,
+    _compact_duration,
     _is_terminal_status_visible,
     build_summary_dict,
+    classify_outcome,
     compose_email_from_summary,
     extract_status,
+    summary_line,
 )
 
 FIXED_TIME = datetime(2026, 5, 21, 14, 32, 14, tzinfo=timezone(timedelta(hours=-6)))
@@ -165,6 +168,104 @@ def test_email_body_pins_to_fixture() -> None:
     )
 
 
+def test_compact_duration() -> None:
+    cases = {
+        "0h 2m 3s": "2m 3s",
+        "0h 0m 9s": "9s",
+        "0h 1m 19s": "1m 19s",
+        "1h 0m 5s": "1h 0m 5s",
+        "2h 14m 0s": "2h 14m 0s",
+        "0h 0m 0s": "0s",
+        "0h 2m": "2m 0s",
+        "?": "?",
+    }
+    for raw, want in cases.items():
+        _assert_eq(f"test_compact_duration[{raw!r}]", _compact_duration(raw), want)
+
+
+def test_classify_outcome() -> None:
+    cases = [
+        # (status, accepted, n_rejected) -> outcome
+        (("Success (2 flights)", 2, 0), "accepted"),
+        # Accepted via the GraphQL re-count: status never said "Success".
+        (("Processed", 1, 0), "accepted"),
+        (("Rejected", 1, 1), "mixed"),
+        (("Success (1 flight)", 1, 1), "mixed"),
+        (("Rejected", 0, 1), "rejected"),
+        (("File Duplicated", 0, 0), "duplicate"),
+        (("File Too Small", 0, 0), "too_small"),
+        (("Success (0 flights)", 0, 0), "none"),
+        (("timeout", 0, 0), "timeout"),
+        (("error: boom", 0, 0), "error"),
+        (("unknown", 0, 0), "unknown"),
+    ]
+    for (status, acc, rej), want in cases:
+        _assert_eq(
+            f"test_classify_outcome[{status!r},{acc},{rej}]",
+            classify_outcome(status, acc, rej),
+            want,
+        )
+
+
+def _rej(duration: str) -> RejectedFlight:
+    return RejectedFlight("2026-06-18", "KLMO", "KLMO", duration)
+
+
+def test_summary_line_reproduces_confusing_email() -> None:
+    """The four lines from the report that prompted this change — now each
+    file's outcome reads consistently and the rejection states its reason."""
+    # File 1: accepted via the count, raw status was not "Success".
+    line1 = summary_line("Processed", 1, [])
+    # File 2: same real outcome, raw status WAS "Success (1 flight)".
+    line2 = summary_line("Success (1 flight)", 1, [])
+    _assert_eq("test_summary_line.file1", line1, "1 flight accepted")
+    _assert_eq("test_summary_line.file2", line2, "1 flight accepted")
+    _assert_eq(
+        "test_summary_line.identical_outcomes_render_identically", line1, line2
+    )
+    # File 3: rejected-only, too short.
+    _assert_eq(
+        "test_summary_line.file3",
+        summary_line("Rejected", 0, [_rej("0h 2m 3s")]),
+        "rejected — too short (2m 3s)",
+    )
+    # File 4: one accepted leg AND one rejected leg in the same CSV.
+    _assert_eq(
+        "test_summary_line.file4",
+        summary_line("Rejected", 1, [_rej("0h 2m 14s")]),
+        "1 accepted, 1 rejected (too short, 2m 14s)",
+    )
+
+
+def test_summary_line_other_outcomes() -> None:
+    cases = [
+        (("Success (3 flights)", 3, []), "3 flights accepted"),
+        (("File Duplicated", 0, []), "already uploaded (duplicate)"),
+        (("File Too Small", 0, []), "file too small — no usable data"),
+        (("Success (0 flights)", 0, []), "no flight recorded"),
+        (("timeout", 0, []), "still processing — will re-check next run"),
+        (("error: boom", 0, []), "upload error — see log"),
+        (("unknown", 0, []), "unrecognised status — see log"),
+    ]
+    for (status, acc, rej), want in cases:
+        _assert_eq(
+            f"test_summary_line_other[{status!r}]",
+            summary_line(status, acc, rej),
+            want,
+        )
+    # Multiple rejected legs: duration is dropped, reason stated once.
+    _assert_eq(
+        "test_summary_line_other.multi_rejected",
+        summary_line("Rejected", 0, [_rej("0h 2m 3s"), _rej("0h 1m 0s")]),
+        "rejected — 2 flights (too short)",
+    )
+    _assert_eq(
+        "test_summary_line_other.multi_rejected_mixed",
+        summary_line("Success (1 flight)", 1, [_rej("0h 2m 3s"), _rej("0h 1m 0s")]),
+        "1 accepted, 2 rejected (too short)",
+    )
+
+
 def test_extract_status_success_singular() -> None:
     _assert_eq(
         "test_extract_status_success_singular",
@@ -282,6 +383,10 @@ def main() -> None:
     test_mixed_success_and_duplicate()
     test_success_with_rejected_flights()
     test_email_body_pins_to_fixture()
+    test_compact_duration()
+    test_classify_outcome()
+    test_summary_line_reproduces_confusing_email()
+    test_summary_line_other_outcomes()
     test_extract_status_success_singular()
     test_extract_status_success_plural()
     test_extract_status_success_zero_is_plural()

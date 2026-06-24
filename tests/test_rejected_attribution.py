@@ -356,12 +356,14 @@ def test_summary_distinguishes_rejection_from_timeout() -> None:
         {"status": "timeout", "n_rejected": 0},
     )
 
-    # And the email projection shows the rejected flight's detail line.
+    # And the email projection renders the clean per-file outcome line plus
+    # the rejected flight's detail line — not the raw "Rejected" status.
     _subject, body = compose_email_from_summary(summary)
     _assert_true(
         "test_summary_distinguishes_rejection_from_timeout.email_shows_rejection",
-        "Flights rejected by Savvy: 1" in body
-        and "KLMO -> KLMO" in body,
+        "Flights rejected: 1" in body
+        and "rejected — too short (1m 19s)" in body
+        and "KLMO -> KLMO  (too short, 1m 19s)" in body,
     )
 
 

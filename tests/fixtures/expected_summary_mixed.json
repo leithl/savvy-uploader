@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run_at": "2026-05-21T14:32:14-06:00",
   "n_skipped": 3,
   "n_verified": 1,
@@ -8,6 +8,8 @@
     {
       "filename": "log_20200101_120000_KAAA.csv",
       "status": "Success (2 flights)",
+      "outcome": "accepted",
+      "summary": "2 flights accepted",
       "flights_accepted": 2,
       "on_savvy": true,
       "rejected_flights": []
@@ -15,6 +17,8 @@
     {
       "filename": "log_20200102_130000_KBBB.csv",
       "status": "File Duplicated",
+      "outcome": "duplicate",
+      "summary": "already uploaded (duplicate)",
       "flights_accepted": 0,
       "on_savvy": true,
       "rejected_flights": []
