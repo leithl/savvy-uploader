@@ -8,6 +8,8 @@ __pycache__/
 # Runtime state
 pending_uploads.json
 unsent_email.json
+# Per-run JSONL (SUMMARY_DIR); read by landing-lab's summary_email.py
+summaries/
 
 # Co-tenant runtime: a separate process consumes BMP screenshots from
 # the same data card, staging here before its own upload. Sibling dirs
