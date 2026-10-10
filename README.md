@@ -183,6 +183,20 @@ export SAVVY_DEPLOY_HOST=your-ssh-alias    # set once in your shell profile
 
 The script prints exactly one final line — `[deploy] DEPLOY OK …` on success, `[deploy] DEPLOY FAILED step="…"` on a known failure, or `[deploy] DEPLOY DID NOT COMPLETE …` if it died silently mid-run. Don't trust a deploy report (yours or an agent's) that doesn't quote one of those back at you.
 
+### Automatic updates on the host
+
+`deploy.sh` only runs when someone remembers to run it. To have the host follow `main` by itself, install the `savvy-self-update` timer, which runs `self_update.sh` every 15 minutes:
+
+```bash
+sed -e 's|/path/to/savvy-upload|'"$PWD"'|g' -e "s|youruser|$USER|" savvy-self-update.service | sudo tee /etc/systemd/system/savvy-self-update.service >/dev/null
+sudo cp savvy-self-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+./self_update.sh --dry-run
+sudo systemctl enable --now savvy-self-update.timer
+```
+
+Each run fetches `origin/main` and fast-forwards the checkout. It refuses (exit 1) when the checkout is off `main`, has edits to tracked files, or has local commits, and never stashes or resets. It restarts `savvy-upload.service` only when `savvy_watch.sh` changed, and only while the watcher is idle, so an upload in progress or a file waiting out the debounce is never lost. The service user needs passwordless `sudo systemctl restart savvy-upload.service`. For an alert when it fails, put `SELF_UPDATE_HEALTHCHECK_URL=<Healthchecks URL>` in `.self-update.env`. Logs: `journalctl -u savvy-self-update.service`.
+
 ## Related projects
 
 - [flashair-sync](https://github.com/leithl/flashair-sync) — Raspberry Pi that pulls CSVs off the FlashAir SD card in the engine monitor and SCPs them to this project's `CSV_DIR`.
@@ -203,4 +217,5 @@ The script expects engine monitor CSV files named `log_YYYYMMDD_HHMMSS_AIRPORT.c
 | `savvy_watch.sh` | File watcher using inotifywait |
 | `savvy_download.py` | Backfill: pulls every CSV Savvy has for the aircraft into `CSV_DIR` |
 | `deploy.sh` | One-command deploy from your laptop (pulls latest on the host, verifies the service). |
+| `self_update.sh` + `savvy-self-update.{service,timer}` | Keeps the host's checkout on `main` every 15 minutes (see Automatic updates). |
 | `.env` | Configuration (not checked into git) |
