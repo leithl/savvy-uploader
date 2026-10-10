@@ -1,0 +1,10 @@
+[Unit]
+Description=Savvy uploader: keep the checkout on origin/main (every 15 min)
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*:0/15
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
